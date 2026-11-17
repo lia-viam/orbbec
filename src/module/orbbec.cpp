@@ -19,7 +19,6 @@
 #include "orbbec_windows_registry.hpp"
 
 #include <algorithm>
-#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -365,8 +364,12 @@ vsdk::Camera::raw_image encodeColorFrame(std::shared_ptr<ob::Frame> color) {
 }  // anonymous namespace
 
 std::vector<std::uint8_t> RGBPointsToPCD(std::shared_ptr<ob::Frame> frame, float scale) {
-    assert(frame->is<ob::PointsFrame>());
-    assert(frame->getFormat() == OBFormat::OB_FORMAT_RGB_POINT);
+    if (!frame->is<ob::PointsFrame>()) {
+        throw std::invalid_argument("RGBPointsToPCD: frame is not a points frame");
+    }
+    if (frame->getFormat() != OBFormat::OB_FORMAT_RGB_POINT) {
+        throw std::invalid_argument("RGBPointsToPCD: frame format is not OB_FORMAT_RGB_POINT");
+    }
 
     auto pointSpan = boost::span{reinterpret_cast<OBColorPoint const*>(frame->data()), frame->dataSize() / sizeof(OBColorPoint)};
 
