@@ -6,8 +6,10 @@
 #
 set -euxo pipefail
 
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+
 if [[ ${OS} == "darwin" ]]; then
-    echo "Detected MacOS ${ARCH}"
+    echo "Detected MacOS"
 
   if ! command -v brew >/dev/null; then
      echo "Brew not installed. Please install brew!"
@@ -16,74 +18,47 @@ if [[ ${OS} == "darwin" ]]; then
   # Install required tools
   brew install cmake python@3.11 wget unzip || true
 elif  [[ ${OS} == "linux" ]]; then
-    echo "Detected Linux $ARCH"
-    # NOTE: this is written under the assumption that it will be built in canon
-    sudo apt -y update && sudo apt -y upgrade && sudo apt install -y cmake python3.11 python3.11-venv wget
+    echo "Detected Linux"
+    # python3 (>= 3.11) and CMake (>= 3.25, installed into the venv below) come from the
+    # build image; apt's versions on focal and bullseye are too old for viam-cpp-sdk.
+    sudo apt-get update && sudo apt-get install -y wget
 else
     echo "Unsupported OS: ${OS}"
     exit 1
 fi
 
-
-rm -rf ${ORBBEC_SDK_DIR}.zip
-rm -rf ${ORBBEC_SDK_DIR}
-wget https://github.com/orbbec/OrbbecSDK_v2/releases/download/${ORBBEC_SDK_VERSION}/${ORBBEC_SDK_DIR}.zip
-unzip ${ORBBEC_SDK_DIR}.zip
-
-# MacOS binary has a different top level dir name than the zip file name
-if [[ ${OS} == "darwin" ]]; then
-TOPDIR=$(ls -d *macOS*/ | head -1 | sed 's#/##')
-mv "${TOPDIR}" "${ORBBEC_SDK_DIR}"
-fi
-
-# lsusb rules only on linux
-if [[ ${OS} == "linux" ]]; then
-  cp ${ORBBEC_SDK_DIR}/shared/99-obsensor-libusb.rules .
-fi
-
-
-if [ ! -f "./venv/bin/activate" ]; then
-  echo 'creating and sourcing virtual env'
-  python3 -m venv venv && source ./venv/bin/activate
+# The build images (cpp-sdk-conan-* in CI, cloud-build-base in cloud build) already have conan on
+# PATH, so a venv is only needed for local development.
+if command -v conan >/dev/null 2>&1; then
+  echo "using conan from $(command -v conan)"
 else
-  echo 'sourcing virtual env'
-  source ./venv/bin/activate
-fi
+  # Debian and Ubuntu ship ensurepip separately in pythonX.Y-venv. Install it only when it is
+  # missing so systems that already provide a working venv are left untouched.
+  if [[ ${OS} == "linux" ]] && ! python3 -c 'import ensurepip' >/dev/null 2>&1; then
+    PY_MINOR=$(python3 -c 'import sys; print(sys.version_info.minor)')
+    sudo apt-get install -y "python3.${PY_MINOR}-venv"
+  fi
 
-# Set up conan
-if [ ! -f "./venv/bin/conan" ]; then
-  echo 'installing conan'
-  python3 -m pip install conan
+  if [ ! -f "./venv/bin/activate" ]; then
+    echo 'creating and sourcing virtual env'
+    # Kept as separate commands: under `set -e` a failure on the left of `&&` does not stop the
+    # script, which previously let a failed venv fall through to pip on the system python.
+    python3 -m venv venv
+    source ./venv/bin/activate
+  else
+    echo 'sourcing virtual env'
+    source ./venv/bin/activate
+  fi
+
+  if [ ! -f "./venv/bin/conan" ]; then
+    echo 'installing conan'
+    python3 -m pip install conan cmake
+  fi
 fi
 
 conan profile detect || echo "Conan is already installed"
 
-if [ ! -d "tmp_cpp_sdk/viam-cpp-sdk" ]; then
-  # Clone the C++ SDK repo
-  mkdir -p tmp_cpp_sdk
-  pushd tmp_cpp_sdk
-  git clone https://github.com/viamrobotics/viam-cpp-sdk.git
-  pushd viam-cpp-sdk
-else
-  pushd tmp_cpp_sdk
-  pushd viam-cpp-sdk
-fi
-
-# NOTE: If you change this version, also change it in the `conanfile.py` requirements
-git checkout releases/v0.16.0
-
-# Build the C++ SDK repo
-#
-# We want a static binary, so we turn off shared. Elect for C++17
-# compilation, since it seems some of the dependencies we pick mandate
-# it anyway.
-conan create . \
-      --build=missing \
-      -o:a "&:shared=False" \
-      -s:a build_type=Release \
-      -s:a compiler.cppstd=17
-
-# Cleanup
-popd  # viam-cpp-sdk
-popd  # tmp_cpp_sdk
-rm -rf tmp_cpp_sdk
+# viam-cpp-sdk and its dependencies come prebuilt from viamconan, at the versions conan.lock pins.
+# It goes first so its binaries win over conancenter's, some of which need a newer glibc than the
+# 2.31 cloud build images have.
+conan remote add viamconan https://viam.jfrog.io/artifactory/api/conan/viamconan --index 0 --force

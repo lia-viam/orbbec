@@ -6,8 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang/geo/r3"
 	"go.viam.com/rdk/components/camera"
 	"go.viam.com/rdk/resource"
+	"go.viam.com/rdk/spatialmath"
 	"go.viam.com/rdk/utils"
 	"go.viam.com/test"
 	"go.viam.com/utils/rpc"
@@ -64,19 +66,23 @@ func TestCameraServer(t *testing.T) {
 		}
 		defer cam.Close(timeoutCtx)
 
-		t.Run("Get image method (one image)", func(t *testing.T) {
+		// Single-source retrieval goes through Images with a filter rather than the image API:
+		// viam-cpp-sdk removed Camera::get_image and the CameraServer no longer serves a GetImage
+		// RPC at all, so there is nothing behind DecodeImageFromCamera for this module to answer.
+		t.Run("Get images method (color only)", func(t *testing.T) {
 			timeout := time.After(testTimeoutDuration)
 			tick := time.Tick(testTickDuration)
 			for {
 				select {
 				case <-timeout:
-					t.Fatal("timed out waiting for Get image method (one image)")
+					t.Fatal("timed out waiting for Get images method (color only)")
 				case <-tick:
-					img, err := camera.DecodeImageFromCamera(timeoutCtx, utils.MimeTypeJPEG, nil, cam)
-					if err != nil {
+					images, _, err := cam.Images(timeoutCtx, []string{"color"}, nil)
+					if err != nil || len(images) < 1 {
 						continue
 					}
-					test.That(t, img, test.ShouldNotBeNil)
+					test.That(t, len(images), test.ShouldEqual, 1)
+					test.That(t, images[0].SourceName, test.ShouldEqual, "color")
 					return
 				}
 			}
@@ -91,7 +97,7 @@ func TestCameraServer(t *testing.T) {
 					t.Fatal("timed out waiting for Get images method (two images)")
 				case <-tick:
 					timeBeforeCall := time.Now()
-					images, metadata, err := cam.Images(timeoutCtx)
+					images, metadata, err := cam.Images(timeoutCtx, nil, nil)
 					if err != nil || len(images) < 2 {
 						continue
 					}
@@ -115,7 +121,12 @@ func TestCameraServer(t *testing.T) {
 							"debug": true,
 						},
 					}
-					err := cam.Reconfigure(timeoutCtx, resource.Dependencies{}, cfg)
+					builtIn, ok := cam.(resource.BuiltInResource)
+					if !ok {
+						t.Skip("camera does not implement BuiltInResource (Reconfigure)")
+						return
+					}
+					err := builtIn.BuiltInReconfigure(timeoutCtx, resource.Dependencies{}, cfg)
 					if err != nil {
 						continue
 					}
@@ -133,7 +144,7 @@ func TestCameraServer(t *testing.T) {
 				case <-timeout:
 					t.Fatal("timed out waiting for Get point cloud method")
 				case <-tick:
-					pc, err := cam.NextPointCloud(timeoutCtx)
+					pc, err := cam.NextPointCloud(timeoutCtx, nil)
 					if err != nil {
 						continue
 					}
@@ -151,6 +162,140 @@ func TestCameraServer(t *testing.T) {
 			test.That(t, props, test.ShouldNotBeNil)
 			test.That(t, props.SupportsPCD, test.ShouldBeTrue)
 			test.That(t, props.IntrinsicParams, test.ShouldNotBeNil)
+		})
+
+		t.Run("Get geometries method", func(t *testing.T) {
+			geometries, err := cam.Geometries(timeoutCtx, nil)
+			test.That(t, err, test.ShouldBeNil)
+			test.That(t, len(geometries), test.ShouldEqual, 1)
+
+			// The pose is the center of the camera body relative to the RGB sensor's optical
+			// center, which is the frame the module reports its data in. See the derivation on
+			// ASTRA2_CONFIG in src/module/orbbec.cpp.
+			expected, err := spatialmath.NewBox(
+				spatialmath.NewPoseFromPoint(r3.Vector{X: 19.00, Y: 5.47, Z: -19.32}),
+				r3.Vector{X: 144.54, Y: 45.35, Z: 38.64},
+				"box",
+			)
+			test.That(t, err, test.ShouldBeNil)
+			test.That(t, spatialmath.GeometriesAlmostEqual(geometries[0], expected), test.ShouldBeTrue)
+		})
+
+		t.Run("DoCommand get_device_properties", func(t *testing.T) {
+			resp, err := cam.DoCommand(timeoutCtx, map[string]interface{}{
+				"get_device_properties": "",
+			})
+			test.That(t, err, test.ShouldBeNil)
+			test.That(t, resp, test.ShouldNotBeNil)
+			_, hasError := resp["error"]
+			test.That(t, hasError, test.ShouldBeFalse)
+		})
+
+		t.Run("DoCommand set_device_property and verify", func(t *testing.T) {
+			// Get a writable property to test with
+			resp, err := cam.DoCommand(timeoutCtx, map[string]interface{}{
+				"get_device_property": "OB_PROP_COLOR_BRIGHTNESS_INT",
+			})
+			test.That(t, err, test.ShouldBeNil)
+			test.That(t, resp, test.ShouldNotBeNil)
+			originalValue, ok := resp["current"].(float64)
+			test.That(t, ok, test.ShouldBeTrue)
+
+			// Set to a new value
+			newValue := originalValue + 1
+			resp, err = cam.DoCommand(timeoutCtx, map[string]interface{}{
+				"set_device_property": map[string]interface{}{
+					"OB_PROP_COLOR_BRIGHTNESS_INT": newValue,
+				},
+			})
+			test.That(t, err, test.ShouldBeNil)
+			_, hasError := resp["error"]
+			test.That(t, hasError, test.ShouldBeFalse)
+
+			// Verify the value was set
+			resp, err = cam.DoCommand(timeoutCtx, map[string]interface{}{
+				"get_device_property": "OB_PROP_COLOR_BRIGHTNESS_INT",
+			})
+			test.That(t, err, test.ShouldBeNil)
+			updatedValue, ok := resp["current"].(float64)
+			test.That(t, ok, test.ShouldBeTrue)
+			test.That(t, updatedValue, test.ShouldEqual, newValue)
+
+			// Restore original value
+			_, err = cam.DoCommand(timeoutCtx, map[string]interface{}{
+				"set_device_property": map[string]interface{}{
+					"OB_PROP_COLOR_BRIGHTNESS_INT": originalValue,
+				},
+			})
+			test.That(t, err, test.ShouldBeNil)
+		})
+
+		t.Run("DoCommand set_device_properties and verify", func(t *testing.T) {
+			// Get current values for two writable properties
+			resp, err := cam.DoCommand(timeoutCtx, map[string]interface{}{
+				"get_device_property": "OB_PROP_COLOR_BRIGHTNESS_INT",
+			})
+			test.That(t, err, test.ShouldBeNil)
+			originalBrightness, ok := resp["current"].(float64)
+			test.That(t, ok, test.ShouldBeTrue)
+
+			resp, err = cam.DoCommand(timeoutCtx, map[string]interface{}{
+				"get_device_property": "OB_PROP_COLOR_CONTRAST_INT",
+			})
+			test.That(t, err, test.ShouldBeNil)
+			originalContrast, ok := resp["current"].(float64)
+			test.That(t, ok, test.ShouldBeTrue)
+
+			// Set both properties at once
+			newBrightness := originalBrightness + 1
+			newContrast := originalContrast + 1
+			resp, err = cam.DoCommand(timeoutCtx, map[string]interface{}{
+				"set_device_properties": map[string]interface{}{
+					"OB_PROP_COLOR_BRIGHTNESS_INT": map[string]interface{}{"current": newBrightness},
+					"OB_PROP_COLOR_CONTRAST_INT":   map[string]interface{}{"current": newContrast},
+				},
+			})
+			test.That(t, err, test.ShouldBeNil)
+			_, hasError := resp["error"]
+			test.That(t, hasError, test.ShouldBeFalse)
+
+			// Verify both values were set
+			resp, err = cam.DoCommand(timeoutCtx, map[string]interface{}{
+				"get_device_property": "OB_PROP_COLOR_BRIGHTNESS_INT",
+			})
+			test.That(t, err, test.ShouldBeNil)
+			updatedBrightness, ok := resp["current"].(float64)
+			test.That(t, ok, test.ShouldBeTrue)
+			test.That(t, updatedBrightness, test.ShouldEqual, newBrightness)
+
+			resp, err = cam.DoCommand(timeoutCtx, map[string]interface{}{
+				"get_device_property": "OB_PROP_COLOR_CONTRAST_INT",
+			})
+			test.That(t, err, test.ShouldBeNil)
+			updatedContrast, ok := resp["current"].(float64)
+			test.That(t, ok, test.ShouldBeTrue)
+			test.That(t, updatedContrast, test.ShouldEqual, newContrast)
+
+			// Restore original values
+			_, err = cam.DoCommand(timeoutCtx, map[string]interface{}{
+				"set_device_properties": map[string]interface{}{
+					"OB_PROP_COLOR_BRIGHTNESS_INT": map[string]interface{}{"current": originalBrightness},
+					"OB_PROP_COLOR_CONTRAST_INT":   map[string]interface{}{"current": originalContrast},
+				},
+			})
+			test.That(t, err, test.ShouldBeNil)
+		})
+
+		t.Run("DoCommand set_device_property unsupported property", func(t *testing.T) {
+			resp, err := cam.DoCommand(timeoutCtx, map[string]interface{}{
+				"set_device_property": map[string]interface{}{
+					"NonExistentProperty": 42,
+				},
+			})
+			test.That(t, err, test.ShouldBeNil)
+			errMsg, hasError := resp["error"]
+			test.That(t, hasError, test.ShouldBeTrue)
+			test.That(t, errMsg, test.ShouldContainSubstring, "not supported")
 		})
 	})
 }

@@ -13,18 +13,27 @@
 // limitations under the License.
 
 #include "orbbec.hpp"
+#include "device_control.hpp"
+#include "encoding.hpp"
+#include "orbbec_firmware.hpp"
+#include "orbbec_windows_registry.hpp"
 
-#include <math.h>
+#include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
-
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 #include <boost/core/span.hpp>
@@ -35,66 +44,126 @@
 #include <viam/sdk/config/resource.hpp>
 #include <viam/sdk/module/service.hpp>
 #include <viam/sdk/registry/registry.hpp>
-#include <viam/sdk/resource/reconfigurable.hpp>
 #include <viam/sdk/rpc/server.hpp>
 
 #include <libobsensor/ObSensor.hpp>
+#include <libobsensor/hpp/TypeHelper.hpp>
 
 namespace orbbec {
 
 namespace vsdk = ::viam::sdk;
 
-vsdk::Model Orbbec::model("viam", "orbbec", "astra2");
-
-const std::string kColorSourceName = "color";
-const std::string kColorMimeTypeJPEG = "image/jpeg";
-const std::string kDepthSourceName = "depth";
-const std::string kDepthMimeTypeViamDep = "image/vnd.viam.dep";
-const std::string kPcdMimeType = "pointcloud/pcd";
+vsdk::Model Orbbec::model_astra2("viam", "orbbec", "astra2");
+vsdk::Model Orbbec::model_gemini_335le("viam", "orbbec", "gemini_335le");
 
 // CONSTANTS BEGIN
+
+const std::string kColorMimeTypeJPEG = "image/jpeg";
+const std::string kColorMimeTypePNG = "image/png";
+
+const std::string kDepthMimeTypeViamDep = "image/vnd.viam.dep";
+const std::string kPcdMimeType = "pointcloud/pcd";
+// If the firmwareUrl is changed to a new version, also change the minFirmwareVer const.
 constexpr char service_name[] = "viam_orbbec";
 const float mmToMeterMultiple = 0.001;
-const uint64_t maxFrameAgeUs = 1e6;  // time until a frame is considered stale, in microseconds (equal to 1 sec)
+const uint64_t maxFrameAgeUs = 1e6;                    // time until a frame is considered stale, in microseconds (equal to 1 sec)
+const uint64_t timestampWarningLogIntervalUs = 300e6;  // log at warning level at most every 5 minutes
+const uint64_t maxFrameSetTimeDiffUs =
+    2000;  // max time difference between frames in a frameset to be considered simultaneous, in microseconds (equal to 2 ms)
 
-// CONSTANTS END
+// Model configurations
+//
+// The body_box / body_box_pose values are derived from the vendor mechanical drawings:
+//   Astra 2:      https://d1cd332k3pgc17.cloudfront.net/wp-content/uploads/2023/04/ORBBEC_Datasheet_Astra-2_V1.1.pdf
+//   Gemini 335Le: https://new-orbbec3d-s3.s3.amazonaws.com/wp-content/uploads/2025/03/24023151/Orbbec-Gemini-335Le-Datasheet-V1-2.pdf
+// Both use the optical frame convention the Gemini 335Le datasheet spells out in section 4.8:
+// +X to the right, +Y down, +Z out of the lens.
+namespace {
+static const OrbbecModelConfig ASTRA2_CONFIG{
+    {"Orbbec Astra 2", "Orbbec Astra2"},                                                   // model_names
+    "astra2",                                                                              // viam_model_suffix
+    {1280, 720},                                                                           // default_color_resolution
+    {1600, 1200},                                                                          // default_depth_resolution
+    "https://orbbec-debian-repos-aws.s3.amazonaws.com/product/Astra2_Release_2.8.20.zip",  // firmware_url
+    "2.8.20",                                                                              // min_firmware_version
+    {{{1920, 1080}, {{1600, 1200}, {800, 600}, {400, 300}}},                               // Supported resolutions, 16:9 aspect ratio
+     {{1440, 1080}, {{1600, 1200}, {800, 600}, {400, 300}}},                               // Supported resolutions, 16:9 aspect ratio
+     {{1280, 720}, {{1600, 1200}, {800, 600}, {400, 300}}},                                // Supported resolutions, 16:9 aspect ratio
+     {{800, 600}, {{800, 600}, {400, 300}}},                                               // Supported resolutions, 4:3 aspect ratio
+     {{640, 480}, {{800, 600}, {400, 300}}},                                               // Supported resolutions, 4:3 aspect ratio
+     {{640, 360}, {{800, 600}, {400, 300}}}},                                              // Supported resolutions, 4:3 aspect ratio
+    {"RGB", "MJPG"},                                                                       // supported_color_formats
+    {"Y16"},                                                                               // supported_depth_formats
+    "MJPG",                                                                                // default_color_format
+    "Y16",                                                                                 // default_depth_format
+    // Body measures 144.54 x 45.35 x 38.64mm including the mounting base, which the box covers
+    // because it is bolted to the camera.
+    {144.54, 45.35, 38.64},  // body_box
+    // x: the LDM and IR modules straddle the body symmetrically (75mm baseline), putting the body
+    //    center 37.50mm from the LDM. RGB sits 56.50mm from the LDM, so the body center is 19.00mm
+    //    towards the LDM from RGB.
+    // y: the modules sit on the body's horizontal centerline, which is 5.47mm above the center of
+    //    the box because the box also spans the mounting base hanging below the body.
+    // z: assumes the optical center lies on the front glass, which is the front face of the box.
+    //    Orbbec does not publish a start point offset for the Astra 2 the way it does for the
+    //    Gemini 335Le, so this is out by however far the sensor sits behind the glass.
+    {{19.00, 5.47, -19.32}}  // body_box_pose
+};
+
+static const OrbbecModelConfig GEMINI_335LE_CONFIG{
+    {"Orbbec Gemini 335Le"},                                                                  // model_names
+    "gemini_335le",                                                                           // viam_model_suffix
+    {1280, 800},                                                                              // default_color_resolution
+    {1280, 800},                                                                              // default_depth_resolution
+    "https://orbbec-debian-repos-aws.s3.amazonaws.com/product/Gemini330_Release_1.5.55.zip",  // firmware_url
+    "1.5.55",                                                                                 // min_firmware_version
+    {{{1280, 800}, {{1280, 800}, {848, 530}, {640, 400}, {424, 266}, {320, 200}}},            // Supported resolutions, 16:10 aspect ratio
+     {{848, 530}, {{848, 530}, {640, 400}, {424, 266}, {320, 200}}},                          // 16:10 aspect ratio
+     {{640, 400}, {{640, 400}, {424, 266}, {320, 200}}},                                      // 16:10 aspect ratio
+     {{640, 480}, {{640, 480}}}},                                                             // 4:3 aspect ratio
+    {"MJPG"},                                                                                 // supported_color_formats
+    {"Y16"},                                                                                  // supported_depth_formats
+    "MJPG",                                                                                   // default_color_format
+    "Y16",                                                                                    // default_depth_format
+    // Body measures 124.02 x 29.03 x 51.20mm. The depth is taken from the right view rather than
+    // the 50mm quoted in the spec table, because the rear M12 connector protrudes 1.20mm past the
+    // housing.
+    {124.02, 29.03, 51.20},  // body_box
+    // x: the two IR modules straddle the body symmetrically (95mm baseline), putting the body
+    //    center 47.50mm from the right IR module. RGB sits 71.25mm from it, so the body center is
+    //    23.75mm towards the right IR module from RGB.
+    // y: the modules sit on the body's horizontal centerline and nothing hangs below the body, so
+    //    the box center is on the optical axis.
+    // z: datasheet section 4.9 puts the RGB start point 4.08mm behind the front glass, and the box
+    //    center is half of 51.20mm behind that same glass.
+    {{23.75, 0.00, -21.52}}  // body_box_pose
+};
+
+static const std::vector<OrbbecModelConfig> all_model_configs = {ASTRA2_CONFIG, GEMINI_335LE_CONFIG};
+}  // namespace
+
+std::optional<OrbbecModelConfig> OrbbecModelConfig::forDevice(const std::string& device_name) {
+    VIAM_SDK_LOG(debug) << "OrbbecModelConfig::forDevice called with device_name: '" << device_name << "'";
+
+    // Check each model config
+    for (const auto& config : all_model_configs) {
+        // First, try exact match on any model name in the set
+        if (config.model_names.count(device_name) != 0) {
+            VIAM_SDK_LOG(debug) << "Found exact match for device_name";
+            return config;
+        }
+    }
+
+    VIAM_SDK_LOG(debug) << "No match found for device_name";
+    return std::nullopt;
+}
 
 // STRUCTS BEGIN
+
 struct PointXYZRGB {
     float x, y, z;
-    unsigned int rgb;
+    std::uint32_t rgb;
 };
-
-struct ViamOBDevice {
-    ~ViamOBDevice() {
-        std::cout << "deleting ViamOBDevice " << serial_number << "\n";
-    }
-    std::string serial_number;
-    std::shared_ptr<ob::Device> device;
-    bool started;
-    std::shared_ptr<ob::Pipeline> pipe;
-    std::shared_ptr<ob::PointCloudFilter> pointCloudFilter;
-    std::shared_ptr<ob::Align> align;
-    std::shared_ptr<ob::Config> config;
-};
-
-class raw_camera_image {
-   public:
-    explicit raw_camera_image(std::size_t sz) : bytes(new unsigned char[sz]), size(sz) {}
-
-    boost::span<unsigned char const> span() const noexcept {
-        return boost::span{bytes.get(), size};
-    }
-
-    boost::span<unsigned char> span() noexcept {
-        return boost::span{bytes.get(), size};
-    }
-
-   private:
-    std::unique_ptr<unsigned char[]> bytes;
-    std::size_t size;
-};
-
 // STRUCTS END
 
 // GLOBALS BEGIN
@@ -133,10 +202,33 @@ std::unordered_map<std::string, std::shared_ptr<ob::FrameSet>>& frame_set_by_ser
     static std::unordered_map<std::string, std::shared_ptr<ob::FrameSet>> frame_sets;
     return frame_sets;
 }
+
+std::mutex& config_by_serial_mu() {
+    static std::mutex mu;
+    return mu;
+}
+
+std::unordered_map<std::string, ObResourceConfig>& config_by_serial() {
+    static std::unordered_map<std::string, ObResourceConfig> config;
+    return config;
+}
 // GLOBALS END
 
 // HELPERS BEGIN
-//
+void checkFirmwareVersion(const std::string version, const std::string& minFirmwareVer, const std::string& modelName) {
+    int major = 0, minor = 0, patch = 0;
+    int requiredMajor = 0, requiredMinor = 0, requiredPatch = 0;
+
+    // ignore any trailing text in the case of a beta or RC version
+    sscanf(version.c_str(), "%d.%d.%d*s", &major, &minor, &patch);
+    sscanf(minFirmwareVer.c_str(), "%d.%d.%d", &requiredMajor, &requiredMinor, &requiredPatch);
+    if ((major < requiredMajor) || (major == requiredMajor && minor < requiredMinor) ||
+        (major == requiredMajor && minor == requiredMinor && patch < requiredPatch)) {
+        throw std::runtime_error("Unsupported firmware version for " + modelName + ". Required: >= " + minFirmwareVer +
+                                 ", Current: " + version + ". Call update_firmware command to upgrade.");
+    }
+}
+
 uint64_t getNowUs() {
     return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
@@ -148,20 +240,144 @@ uint64_t timeSinceFrameUs(uint64_t nowUs, uint64_t imageTimeUs) {
     return 0;
 }
 
-std::vector<unsigned char> RGBPointsToPCD(std::shared_ptr<ob::Frame> frame, float scale) {
+namespace {
+
+// Helper function to format error messages
+template <typename... Args>
+std::string formatError(Args&&... args) {
+    std::ostringstream buffer;
+    (buffer << ... << args);
+    return buffer.str();
+}
+
+// Get the best available timestamp for a frame (Global > System)
+uint64_t getBestTimestampUs(std::shared_ptr<ob::Frame> frame) {
+    if (frame == nullptr) {
+        return 0;
+    }
+    uint64_t ts = frame->getGlobalTimeStampUs();
+    if (ts > 0) {
+        return ts;
+    }
+    return frame->getSystemTimeStampUs();
+}
+
+// Validate color frame format and timestamp
+void validateColorFrame(std::shared_ptr<ob::Frame> color,
+                        const std::optional<DeviceFormat>& device_format_opt,
+                        const OrbbecModelConfig& modelConfig) {
+    if (color == nullptr) {
+        throw std::runtime_error("no color frame");
+    }
+
+    // Format validation
+    std::string frameFormat = ob::TypeHelper::convertOBFormatTypeToString(color->getFormat());
+    if (modelConfig.supported_color_formats.count(frameFormat) == 0) {
+        std::ostringstream buffer;
+        buffer << "unsupported color format: " << frameFormat << ", supported: ";
+        for (const auto& fmt : modelConfig.supported_color_formats) {
+            buffer << fmt << " ";
+        }
+        throw std::runtime_error(buffer.str());
+    }
+
+    // Timestamp validation
+    uint64_t nowUs = getNowUs();
+    uint64_t diff = timeSinceFrameUs(nowUs, getBestTimestampUs(color));
+    if (diff > maxFrameAgeUs) {
+        throw std::runtime_error(formatError("no recent color frame: check connection, diff: ", diff, "us"));
+    }
+
+    // Config format validation
+    if (device_format_opt.has_value() && device_format_opt->color_format.has_value()) {
+        if (frameFormat != device_format_opt->color_format.value()) {
+            throw std::runtime_error(
+                formatError("color format mismatch, expected ", device_format_opt->color_format.value(), " got ", frameFormat));
+        }
+    } else if (frameFormat != modelConfig.default_color_format) {
+        throw std::runtime_error(formatError("color format mismatch, expected ", modelConfig.default_color_format, " got ", frameFormat));
+    }
+}
+
+// Validate depth frame format and timestamp
+void validateDepthFrame(std::shared_ptr<ob::Frame> depth,
+                        const std::optional<DeviceFormat>& device_format_opt,
+                        const OrbbecModelConfig& modelConfig) {
+    if (depth == nullptr) {
+        throw std::runtime_error("no depth frame");
+    }
+
+    // Format validation
+    std::string frameFormat = ob::TypeHelper::convertOBFormatTypeToString(depth->getFormat());
+    if (modelConfig.supported_depth_formats.count(frameFormat) == 0) {
+        std::ostringstream buffer;
+        buffer << "unsupported depth format: " << frameFormat << ", supported: ";
+        for (const auto& fmt : modelConfig.supported_depth_formats) {
+            buffer << fmt << " ";
+        }
+        throw std::runtime_error(buffer.str());
+    }
+
+    // Timestamp validation
+    uint64_t nowUs = getNowUs();
+    uint64_t diff = timeSinceFrameUs(nowUs, getBestTimestampUs(depth));
+    if (diff > maxFrameAgeUs) {
+        throw std::runtime_error(formatError("no recent depth frame: check connection, diff: ", diff, "us"));
+    }
+
+    // Config format validation
+    if (device_format_opt.has_value() && device_format_opt->depth_format.has_value()) {
+        if (frameFormat != device_format_opt->depth_format.value()) {
+            throw std::runtime_error(
+                formatError("depth format mismatch, expected ", device_format_opt->depth_format.value(), " got ", frameFormat));
+        }
+    } else if (frameFormat != modelConfig.default_depth_format) {
+        throw std::runtime_error(formatError("depth format mismatch, expected ", modelConfig.default_depth_format, " got ", frameFormat));
+    }
+}
+
+// Encode color frame to raw_image
+vsdk::Camera::raw_image encodeColorFrame(std::shared_ptr<ob::Frame> color) {
+    vsdk::Camera::raw_image image;
+    image.source_name = kColorSourceName;
+
+    std::uint8_t* colorData = (std::uint8_t*)color->getData();
+    if (colorData == nullptr) {
+        throw std::runtime_error("color data is null");
+    }
+    uint32_t colorDataSize = color->dataSize();
+
+    if (color->getFormat() == OB_FORMAT_MJPG) {
+        image.mime_type = kColorMimeTypeJPEG;
+        image.bytes.assign(colorData, colorData + colorDataSize);
+    } else if (color->getFormat() == OB_FORMAT_RGB) {
+        image.mime_type = kColorMimeTypePNG;
+        auto width = color->getStreamProfile()->as<ob::VideoStreamProfile>()->getWidth();
+        auto height = color->getStreamProfile()->as<ob::VideoStreamProfile>()->getHeight();
+        image.bytes = encoding::encode_to_png(colorData, width, height);
+    } else {
+        throw std::runtime_error(
+            formatError("unsupported color format: ", ob::TypeHelper::convertOBFormatTypeToString(color->getFormat())));
+    }
+    return image;
+}
+
+}  // anonymous namespace
+
+std::vector<std::uint8_t> RGBPointsToPCD(std::shared_ptr<ob::Frame> frame, float scale) {
     assert(frame->is<ob::PointsFrame>());
     assert(frame->getFormat() == OBFormat::OB_FORMAT_RGB_POINT);
 
-    auto pointSpan = boost::span{reinterpret_cast<OBColorPoint*>(frame->data()), frame->dataSize() / sizeof(OBColorPoint)};
+    auto pointSpan = boost::span{reinterpret_cast<OBColorPoint const*>(frame->data()), frame->dataSize() / sizeof(OBColorPoint)};
 
     std::vector<PointXYZRGB> pcdPoints;
 
     std::transform(pointSpan.begin(), pointSpan.end(), std::back_inserter(pcdPoints), [scale](const OBColorPoint& p) {
-        auto r = static_cast<unsigned int>(p.r);
-        auto g = static_cast<unsigned int>(p.g);
-        auto b = static_cast<unsigned int>(p.b);
+        auto r = static_cast<std::uint32_t>(p.r);
+        auto g = static_cast<std::uint32_t>(p.g);
+        auto b = static_cast<std::uint32_t>(p.b);
 
-        unsigned int rgb = (r << 16) | (g << 8) | b;
+        std::uint32_t rgb = (r << 16) | (g << 8) | b;
         return PointXYZRGB{p.x * scale,  //
                            p.y * scale,  //
                            p.z * scale,  //
@@ -180,17 +396,16 @@ std::vector<unsigned char> RGBPointsToPCD(std::shared_ptr<ob::Frame> frame, floa
            << "POINTS " << pcdPoints.size() << "\n"
            << "DATA binary\n";
     std::string headerStr = header.str();
-    std::vector<unsigned char> pcdBytes;
+    std::vector<std::uint8_t> pcdBytes;
     pcdBytes.insert(pcdBytes.end(), headerStr.begin(), headerStr.end());
 
-    // Assert that PointXYZRGB is a POD type, and that it has no padding, thus can be copied as bytes.
-    // Since vector is contiguous, we can just copy the whole thing
+    // PointXYZRGB is POD with no padding, and vector is contiguous, so the points can be copied as bytes.
     static_assert(std::is_pod_v<PointXYZRGB>);
-    static_assert(sizeof(PointXYZRGB) == (3 * sizeof(float)) + sizeof(unsigned int), "PointXYZRGB has unexpected padding");
+    static_assert(sizeof(PointXYZRGB) == (3 * sizeof(float)) + sizeof(std::uint32_t), "PointXYZRGB has unexpected padding");
 
     auto byteSpan = boost::as_bytes(boost::span{pcdPoints});
     pcdBytes.insert(
-        pcdBytes.end(), reinterpret_cast<unsigned char const*>(byteSpan.begin()), reinterpret_cast<unsigned char const*>(byteSpan.end()));
+        pcdBytes.end(), reinterpret_cast<std::uint8_t const*>(byteSpan.begin()), reinterpret_cast<std::uint8_t const*>(byteSpan.end()));
 
     return pcdBytes;
 }
@@ -240,8 +455,9 @@ bool checkIfSupportHWD2CAlign(std::shared_ptr<ob::Pipeline> pipe,
         auto vsp = sp->as<ob::VideoStreamProfile>();
         if (vsp->getWidth() == depthVsp->getWidth() && vsp->getHeight() == depthVsp->getHeight() &&
             vsp->getFormat() == depthVsp->getFormat() && vsp->getFps() == depthVsp->getFps()) {
-            VIAM_SDK_LOG(info) << "using width: " << vsp->getWidth() << " height: " << vsp->getHeight() << " format: " << vsp->getFormat()
-                               << " fps: " << vsp->getFps() << "\n";
+            VIAM_SDK_LOG(info) << "[checkIfSupportHWD2CAlign] using width: " << vsp->getWidth() << " height: " << vsp->getHeight()
+                               << " format: " << ob::TypeHelper::convertOBFormatTypeToString(vsp->getFormat()) << " fps: " << vsp->getFps()
+                               << "\n";
             // Found a matching depth stream profile, it means the given stream
             // profiles support hardware depth-to-color alignment
             return true;
@@ -250,67 +466,207 @@ bool checkIfSupportHWD2CAlign(std::shared_ptr<ob::Pipeline> pipe,
     return false;
 }
 
-// create a config for hardware depth-to-color alignment
-std::shared_ptr<ob::Config> createHwD2CAlignConfig(std::shared_ptr<ob::Pipeline> pipe) {
+// Helper function to check if a video stream profile matches the given resolution and format
+bool profileMatchesSpec(std::shared_ptr<ob::VideoStreamProfile> vsp,
+                        std::optional<DeviceResolution> deviceRes,
+                        std::optional<DeviceFormat> deviceFormat,
+                        const OrbbecModelConfig& modelConfig,
+                        bool isColor) {
+    if (deviceFormat.has_value()) {
+        std::string requestedFormat = isColor ? (deviceFormat->color_format.has_value() ? deviceFormat->color_format.value() : "")
+                                              : (deviceFormat->depth_format.has_value() ? deviceFormat->depth_format.value() : "");
+        if (!requestedFormat.empty() && ob::TypeHelper::convertOBFormatTypeToString(vsp->getFormat()) != requestedFormat) {
+            return false;
+        }
+    } else {
+        std::string defaultFormat = isColor ? modelConfig.default_color_format : modelConfig.default_depth_format;
+        if (ob::TypeHelper::convertOBFormatTypeToString(vsp->getFormat()) != defaultFormat) {
+            return false;
+        }
+    }
+
+    if (deviceRes.has_value()) {
+        auto requestedRes = isColor ? deviceRes->color_resolution : deviceRes->depth_resolution;
+        if (requestedRes.has_value() && (vsp->getWidth() != requestedRes->width || vsp->getHeight() != requestedRes->height)) {
+            return false;
+        }
+    } else {
+        auto defaultRes = isColor ? modelConfig.default_color_resolution : modelConfig.default_depth_resolution;
+        if (vsp->getWidth() != defaultRes.width || vsp->getHeight() != defaultRes.height) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// Helper function to find matching stream profiles
+std::pair<std::shared_ptr<ob::StreamProfile>, std::shared_ptr<ob::StreamProfile>> findMatchingProfiles(
+    std::shared_ptr<ob::Pipeline> pipe,
+    std::optional<DeviceResolution> deviceRes,
+    std::optional<DeviceFormat> deviceFormat,
+    const OrbbecModelConfig& modelConfig) {
     auto colorStreamProfiles = pipe->getStreamProfileList(OB_SENSOR_COLOR);
     auto depthStreamProfiles = pipe->getStreamProfileList(OB_SENSOR_DEPTH);
 
-    // Iterate through all color and depth stream profiles to find a match for
-    // hardware depth-to-color alignment
     auto colorSpCount = colorStreamProfiles->getCount();
     auto depthSpCount = depthStreamProfiles->getCount();
+
     for (uint32_t i = 0; i < colorSpCount; i++) {
         auto colorProfile = colorStreamProfiles->getProfile(i);
         auto colorVsp = colorProfile->as<ob::VideoStreamProfile>();
+
+        if (!profileMatchesSpec(colorVsp, deviceRes, deviceFormat, modelConfig, true)) {
+            continue;
+        }
+
         for (uint32_t j = 0; j < depthSpCount; j++) {
             auto depthProfile = depthStreamProfiles->getProfile(j);
             auto depthVsp = depthProfile->as<ob::VideoStreamProfile>();
 
-            // make sure the color and depth stream have the same fps, due to some
-            // models may not support different fps
+            // make sure the color and depth stream have the same fps
             if (colorVsp->getFps() != depthVsp->getFps()) {
                 continue;
             }
 
-            // Check if the given stream profiles support hardware depth-to-color
-            // alignment
+            if (!profileMatchesSpec(depthVsp, deviceRes, deviceFormat, modelConfig, false)) {
+                continue;
+            }
+
+            return std::make_pair(colorProfile, depthProfile);
+        }
+    }
+
+    return std::make_pair(nullptr, nullptr);
+}
+
+// Helper function to build error message for missing profiles
+std::string buildProfileErrorMsg(bool isColor, std::optional<DeviceResolution> deviceRes, std::optional<DeviceFormat> deviceFormat) {
+    std::ostringstream buffer;
+    buffer << service_name << " does not support the requested " << (isColor ? "color" : "depth") << " resolution/format: ";
+    auto res = isColor ? (deviceRes.has_value() ? deviceRes->color_resolution : std::nullopt)
+                       : (deviceRes.has_value() ? deviceRes->depth_resolution : std::nullopt);
+    if (res.has_value()) {
+        buffer << "resolution " << res->width << "x" << res->height;
+    }
+    auto fmt = isColor ? (deviceFormat.has_value() ? deviceFormat->color_format : std::nullopt)
+                       : (deviceFormat.has_value() ? deviceFormat->depth_format : std::nullopt);
+    if (fmt.has_value()) {
+        buffer << ", format " << fmt.value();
+    }
+    return buffer.str();
+}
+
+// create a config for software depth-to-color alignment with specified resolution/format
+std::shared_ptr<ob::Config> createSwD2CAlignConfig(std::shared_ptr<ob::Pipeline> pipe,
+                                                   std::optional<DeviceResolution> deviceRes,
+                                                   std::optional<DeviceFormat> deviceFormat,
+                                                   const OrbbecModelConfig& modelConfig) {
+    if (deviceRes.has_value()) {
+        VIAM_SDK_LOG(info) << "[createSwD2CAlignConfig] resolution specified: " << deviceRes->to_string();
+    }
+    if (deviceFormat.has_value()) {
+        VIAM_SDK_LOG(info) << "[createSwD2CAlignConfig] format specified: " << deviceFormat->to_string();
+    }
+
+    // Find matching color and depth profiles
+    auto [colorProfile, depthProfile] = findMatchingProfiles(pipe, deviceRes, deviceFormat, modelConfig);
+
+    if (!colorProfile || !depthProfile) {
+        VIAM_SDK_LOG(warn) << "[createSwD2CAlignConfig] Could not find matching stream profiles for software depth-to-color alignment that "
+                           << "also match the given resolution and format specification ("
+                           << (deviceRes.has_value() ? deviceRes->to_string() : "none") << ", "
+                           << (deviceFormat.has_value() ? deviceFormat->to_string() : "none") << ")\n";
+        return nullptr;
+    }
+
+    auto config = std::make_shared<ob::Config>();
+    config->enableStream(colorProfile);
+    config->enableStream(depthProfile);
+    config->setAlignMode(ALIGN_D2C_SW_MODE);  // Use software alignment
+    config->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE);
+
+    auto colorVsp = colorProfile->as<ob::VideoStreamProfile>();
+    auto depthVsp = depthProfile->as<ob::VideoStreamProfile>();
+    VIAM_SDK_LOG(info) << "Using software depth-to-color alignment with color " << colorVsp->getWidth() << "x" << colorVsp->getHeight()
+                       << " and depth " << depthVsp->getWidth() << "x" << depthVsp->getHeight();
+
+    return config;
+}
+
+// create a config for hardware depth-to-color alignment
+std::shared_ptr<ob::Config> createHwD2CAlignConfig(std::shared_ptr<ob::Pipeline> pipe,
+                                                   std::optional<DeviceResolution> deviceRes,
+                                                   std::optional<DeviceFormat> deviceFormat,
+                                                   const OrbbecModelConfig& modelConfig) {
+    if (deviceRes.has_value()) {
+        VIAM_SDK_LOG(info) << "[createHwD2CAlignConfig] resolution specified: " << deviceRes->to_string();
+    }
+    if (deviceFormat.has_value()) {
+        VIAM_SDK_LOG(info) << "[createHwD2CAlignConfig] format specified: " << deviceFormat->to_string();
+    }
+
+    // Find matching color and depth profiles that support hardware D2C alignment
+    auto colorStreamProfiles = pipe->getStreamProfileList(OB_SENSOR_COLOR);
+    auto depthStreamProfiles = pipe->getStreamProfileList(OB_SENSOR_DEPTH);
+
+    auto colorSpCount = colorStreamProfiles->getCount();
+    auto depthSpCount = depthStreamProfiles->getCount();
+
+    for (uint32_t i = 0; i < colorSpCount; i++) {
+        auto colorProfile = colorStreamProfiles->getProfile(i);
+        auto colorVsp = colorProfile->as<ob::VideoStreamProfile>();
+
+        if (!profileMatchesSpec(colorVsp, deviceRes, deviceFormat, modelConfig, true)) {
+            continue;
+        }
+
+        for (uint32_t j = 0; j < depthSpCount; j++) {
+            auto depthProfile = depthStreamProfiles->getProfile(j);
+            auto depthVsp = depthProfile->as<ob::VideoStreamProfile>();
+
+            // make sure the color and depth stream have the same fps
+            if (colorVsp->getFps() != depthVsp->getFps()) {
+                continue;
+            }
+
+            if (!profileMatchesSpec(depthVsp, deviceRes, deviceFormat, modelConfig, false)) {
+                continue;
+            }
+
+            // Check if the given stream profiles support hardware depth-to-color alignment
             if (checkIfSupportHWD2CAlign(pipe, colorProfile, depthProfile)) {
+                VIAM_SDK_LOG(info) << "[createHwD2CAlignConfig] Using hardware depth-to-color alignment with color stream "
+                                   << colorVsp->getWidth() << "x" << colorVsp->getHeight() << "@" << colorVsp->getFps()
+                                   << ", format: " << ob::TypeHelper::convertOBFormatTypeToString(colorVsp->getFormat())
+                                   << " and depth stream " << depthVsp->getWidth() << "x" << depthVsp->getHeight() << "@"
+                                   << depthVsp->getFps()
+                                   << " format: " << ob::TypeHelper::convertOBFormatTypeToString(depthVsp->getFormat()) << "\n";
                 // If support, create a config for hardware depth-to-color alignment
                 auto hwD2CAlignConfig = std::make_shared<ob::Config>();
                 hwD2CAlignConfig->enableStream(colorProfile);       // enable color stream
                 hwD2CAlignConfig->enableStream(depthProfile);       // enable depth stream
                 hwD2CAlignConfig->setAlignMode(ALIGN_D2C_HW_MODE);  // enable hardware depth-to-color alignment
-                hwD2CAlignConfig->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE);  // output
-                                                                                                                  // frameset
-                                                                                                                  // with all
-                                                                                                                  // types of
-                                                                                                                  // frames
+                hwD2CAlignConfig->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE);
                 return hwD2CAlignConfig;
+            } else {
+                VIAM_SDK_LOG(warn) << "[createHwD2CAlignConfig] color stream " << colorVsp->getWidth() << "x" << colorVsp->getHeight()
+                                   << "@" << colorVsp->getFps() << " and depth stream " << depthVsp->getWidth() << "x"
+                                   << depthVsp->getHeight() << "@" << depthVsp->getFps()
+                                   << " do NOT support hardware depth-to-color alignment\n";
             }
         }
     }
+
+    VIAM_SDK_LOG(warn) << "[createHwD2CAlignConfig] Could not find matching stream profiles for hardware depth-to-color alignment that "
+                          "also match the given resolution and format specification ("
+                       << (deviceRes.has_value() ? deviceRes->to_string() : "none") << ", "
+                       << (deviceFormat.has_value() ? deviceFormat->to_string() : "none") << ")\n";
     return nullptr;
 }
 
-void startDevice(std::string serialNumber, std::string resourceName) {
-    VIAM_SDK_LOG(info) << service_name << ": starting device " << serialNumber;
-    std::lock_guard<std::mutex> lock(devices_by_serial_mu());
-
-    auto search = devices_by_serial().find(serialNumber);
-    if (search == devices_by_serial().end()) {
-        std::ostringstream buffer;
-        buffer << service_name << ": unable to start undetected device" << serialNumber;
-        throw std::invalid_argument(buffer.str());
-    }
-
-    std::unique_ptr<ViamOBDevice>& my_dev = search->second;
-    if (my_dev->started) {
-        std::ostringstream buffer;
-        buffer << service_name << ": unable to start already started device" << serialNumber;
-        throw std::invalid_argument(buffer.str());
-    }
-
-    auto frameCallback = [serialNumber](std::shared_ptr<ob::FrameSet> frameSet) {
+auto frameCallback(const std::string& serialNumber) {
+    return [serialNumber](std::shared_ptr<ob::FrameSet> frameSet) {
         if (frameSet->getCount() != 2) {
             std::cerr << "got non 2 frame count: " << frameSet->getCount() << "\n";
             return;
@@ -329,40 +685,242 @@ void startDevice(std::string serialNumber, std::string resourceName) {
 
         std::lock_guard<std::mutex> lock(frame_set_by_serial_mu());
         uint64_t nowUs = getNowUs();
-        uint64_t diff = timeSinceFrameUs(nowUs, color->getSystemTimeStampUs());
+        uint64_t diff = timeSinceFrameUs(nowUs, getBestTimestampUs(color));
         if (diff > maxFrameAgeUs) {
-            std::cerr << "color frame is " << diff << "us older than now, nowUs: " << nowUs << " frameTimeUs "
-                      << color->getSystemTimeStampUs() << "\n";
+            std::cerr << "color frame is " << diff << "us older than now, nowUs: " << nowUs << " frameTimeUs " << getBestTimestampUs(color)
+                      << "\n";
         }
-        diff = timeSinceFrameUs(nowUs, depth->getSystemTimeStampUs());
+        diff = timeSinceFrameUs(nowUs, getBestTimestampUs(depth));
         if (diff > maxFrameAgeUs) {
-            std::cerr << "depth frame is " << diff << "us older than now, nowUs: " << nowUs << " frameTimeUs "
-                      << depth->getSystemTimeStampUs() << "\n";
+            std::cerr << "depth frame is " << diff << "us older than now, nowUs: " << nowUs << " frameTimeUs " << getBestTimestampUs(depth)
+                      << "\n";
         }
 
         auto it = frame_set_by_serial().find(serialNumber);
         if (it != frame_set_by_serial().end()) {
-            std::shared_ptr<ob::Frame> prevColor = frameSet->getFrame(OB_FRAME_COLOR);
-            std::shared_ptr<ob::Frame> prevDepth = frameSet->getFrame(OB_FRAME_DEPTH);
+            std::shared_ptr<ob::Frame> prevColor = it->second->getFrame(OB_FRAME_COLOR);
+            std::shared_ptr<ob::Frame> prevDepth = it->second->getFrame(OB_FRAME_DEPTH);
             if (prevColor != nullptr && prevDepth != nullptr) {
-                diff = timeSinceFrameUs(color->getSystemTimeStampUs(), prevColor->getSystemTimeStampUs());
+                diff = timeSinceFrameUs(getBestTimestampUs(color), getBestTimestampUs(prevColor));
                 if (diff > maxFrameAgeUs) {
-                    std::cerr << "previous color frame is " << diff << "us older than current color frame. nowUs: " << nowUs
-                              << " frameTimeUs " << color->getSystemTimeStampUs() << "\n";
+                    std::cerr << "previous color frame is " << diff
+                              << "us older than current color frame. previousUs: " << getBestTimestampUs(prevColor)
+                              << " currentUs: " << getBestTimestampUs(color) << "\n";
                 }
-                diff = timeSinceFrameUs(depth->getSystemTimeStampUs(), prevDepth->getSystemTimeStampUs());
+                diff = timeSinceFrameUs(getBestTimestampUs(depth), getBestTimestampUs(prevDepth));
                 if (diff > maxFrameAgeUs) {
-                    std::cerr << "previous depth frame is " << diff << "us older than current depth frame. nowUs: " << nowUs
-                              << " frameTimeUs " << depth->getSystemTimeStampUs() << "\n";
+                    std::cerr << "previous depth frame is " << diff
+                              << "us older than current depth frame. previousUs: " << getBestTimestampUs(prevDepth)
+                              << " currentUs: " << getBestTimestampUs(depth) << "\n";
                 }
             }
         }
         frame_set_by_serial()[serialNumber] = frameSet;
     };
+}
 
-    my_dev->pipe->start(my_dev->config, std::move(frameCallback));
+// Returns a non-empty warning string if the device is on a slow USB connection, empty otherwise.
+// On Linux, enriches the message with the actual negotiated link speed read from sysfs.
+std::string buildUsbSpeedWarning(std::shared_ptr<ob::DeviceInfo> deviceInfo) {
+    std::string connectionType = deviceInfo->getConnectionType();
+    bool isSlowConnection = (connectionType == "USB" || connectionType == "USB1.0" || connectionType == "USB1.1" ||
+                             connectionType == "USB2.0" || connectionType == "USB2.1");
+    if (!isSlowConnection) {
+        return "";
+    }
+
+    std::ostringstream msg;
+    msg << "device is connected via " << connectionType;
+
+#ifdef __linux__
+    // On Linux, the UID is "bus-port-dev" (e.g. "3-12-54"). Strip the trailing "-dev"
+    // to get the sysfs path /sys/bus/usb/devices/<bus-port>/speed which reports the
+    // actual negotiated link speed in Mbps.
+    std::string uid = deviceInfo->getUid();
+    auto lastDash = uid.rfind('-');
+    if (lastDash != std::string::npos) {
+        std::string busPort = uid.substr(0, lastDash);
+        std::ifstream speedFile("/sys/bus/usb/devices/" + busPort + "/speed");
+        if (speedFile.is_open()) {
+            std::string speed;
+            speedFile >> speed;
+            msg << ", negotiated speed: " << speed << " Mbps (path: /sys/bus/usb/devices/" << busPort << ")";
+        }
+    }
+#endif
+
+    msg << ". USB 3.0 (5000 Mbps) or higher is required for reliable operation,"
+        << " frames may not be delivered — check cable and port";
+    return msg.str();
+}
+
+void checkUsbConnectionSpeed(const std::unique_ptr<ViamOBDevice>& dev, const std::string& serialNumber) {
+    std::string warning = buildUsbSpeedWarning(dev->device->getDeviceInfo());
+    if (!warning.empty()) {
+        VIAM_SDK_LOG(warn) << "[configureDevice] Device " << serialNumber << ": " << warning;
+    }
+}
+
+void configureDevice(std::string serialNumber, OrbbecModelConfig const& modelConfig) {
+    VIAM_SDK_LOG(info) << "[configureDevice] Configuring device " << serialNumber;
+    std::lock_guard<std::mutex> lock(devices_by_serial_mu());
+    auto search = devices_by_serial().find(serialNumber);
+    if (search == devices_by_serial().end()) {
+        std::ostringstream buffer;
+        buffer << service_name << ": unable to configure undetected device " << serialNumber;
+        throw std::invalid_argument(buffer.str());
+    }
+
+    std::unique_ptr<ViamOBDevice>& my_dev = search->second;
+
+    checkUsbConnectionSpeed(my_dev, serialNumber);
+
+    // Enable global timestamp if supported
+    if (my_dev->device->isGlobalTimestampSupported()) {
+        my_dev->device->enableGlobalTimestamp(true);
+        VIAM_SDK_LOG(info) << "[configureDevice] Global timestamp enabled for device " << serialNumber;
+    } else {
+        VIAM_SDK_LOG(info) << "[configureDevice] Global timestamp not supported for device " << serialNumber;
+    }
+
+    // Initialize fields if not already set
+    if (!my_dev->pipe) {
+        my_dev->pipe = std::make_shared<ob::Pipeline>(my_dev->device);
+        my_dev->pipe->enableFrameSync();
+    }
+    if (!my_dev->pointCloudFilter) {
+        my_dev->pointCloudFilter = std::make_shared<ob::PointCloudFilter>();
+        my_dev->pointCloudFilter->setCreatePointFormat(OB_FORMAT_RGB_POINT);
+    }
+    if (!my_dev->align) {
+        my_dev->align = std::make_shared<ob::Align>(OB_STREAM_COLOR);
+    }
+    if (my_dev->postProcessDepthFilters.empty()) {
+        auto depthSensor = my_dev->device->getSensor(OB_SENSOR_DEPTH);
+        if (depthSensor == nullptr) {
+            throw std::runtime_error("Current device does not have a depth sensor.");
+        }
+        my_dev->postProcessDepthFilters = depthSensor->createRecommendedFilters();
+        my_dev->applyEnabledPostProcessDepthFilters = false;
+    }
+
+    // Get user-specified resolution/format if any
+    std::optional<DeviceResolution> resolution_opt;
+    std::optional<DeviceFormat> format_opt;
+    {
+        std::lock_guard<std::mutex> configLock(config_by_serial_mu());
+        if (config_by_serial().count(serialNumber) > 0) {
+            resolution_opt = config_by_serial().at(serialNumber).device_resolution;
+            format_opt = config_by_serial().at(serialNumber).device_format;
+            VIAM_SDK_LOG(info) << "[configureDevice] Resolution from config: "
+                               << (resolution_opt.has_value() ? resolution_opt->to_string() : "not specified, Format from config: ")
+                               << (format_opt.has_value() ? format_opt->to_string() : "not specified");
+        } else {
+            VIAM_SDK_LOG(info) << "[configureDevice] No custom config for " << serialNumber << ", using defaults";
+        }
+    }
+
+    // Create the pipeline config (with user settings if provided, otherwise defaults)
+    // Lets try hardware depth-to-color alignment first, if it fails, try software alignment
+    auto config = createHwD2CAlignConfig(my_dev->pipe, resolution_opt, format_opt, modelConfig);
+    if (config == nullptr) {
+        VIAM_SDK_LOG(warn) << "Device " << serialNumber << " does not support hardware depth-to-color alignment, trying software alignment";
+        // Use software alignment
+        if (resolution_opt.has_value() || format_opt.has_value()) {
+            config = createSwD2CAlignConfig(my_dev->pipe, resolution_opt, format_opt, modelConfig);
+            if (config == nullptr) {
+                std::ostringstream buffer;
+                buffer << service_name << ": unable to configure device " << serialNumber
+                       << " with software D2C alignment for the requested resolution/format";
+                throw std::runtime_error(buffer.str());
+            }
+        } else {
+            // If the user didn't specify a resolution or format, use the first available profiles
+            auto colorStreamProfiles = my_dev->pipe->getStreamProfileList(OB_SENSOR_COLOR);
+            auto depthStreamProfiles = my_dev->pipe->getStreamProfileList(OB_SENSOR_DEPTH);
+            if (colorStreamProfiles->getCount() > 0 && depthStreamProfiles->getCount() > 0) {
+                config = std::make_shared<ob::Config>();
+                config->enableStream(colorStreamProfiles->getProfile(0));
+                config->enableStream(depthStreamProfiles->getProfile(0));
+                config->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE);
+                VIAM_SDK_LOG(info) << "Created basic config for device " << serialNumber;
+            } else {
+                throw std::runtime_error("No stream profiles available");
+            }
+        }
+        if (config != nullptr) {
+            VIAM_SDK_LOG(info) << "Device " << serialNumber << " supports software depth-to-color alignment, using it";
+        }
+    } else {
+        VIAM_SDK_LOG(info) << "Device " << serialNumber << " supports hardware depth-to-color alignment, using it";
+    }
+
+    // If color and depth are enabled and they operate on the same FPS, we can enable OB_MULTI_DEVICE_SYNC_MODE_STANDALONE to make color and
+    // depth frames to be synced. More info here:
+    // https://orbbec.github.io/OrbbecSDK/doc/api/English/ObTypes_8h.html#aabad929b67059752029c3374594ac63ba6bd45c53211519f5392eab382e229225
+    if (config != nullptr) {
+        std::shared_ptr<ob::VideoStreamProfile> colorProfile = nullptr;
+        std::shared_ptr<ob::VideoStreamProfile> depthProfile = nullptr;
+        auto profiles = config->getEnabledStreamProfileList();
+        for (uint32_t i = 0; i < profiles->getCount(); i++) {
+            auto profile = profiles->getProfile(i);
+            if (profile->getType() == OB_STREAM_COLOR) {
+                colorProfile = profile->as<ob::VideoStreamProfile>();
+            } else if (profile->getType() == OB_STREAM_DEPTH) {
+                depthProfile = profile->as<ob::VideoStreamProfile>();
+            }
+        }
+
+        if (colorProfile != nullptr && depthProfile != nullptr && colorProfile->getFps() == depthProfile->getFps()) {
+            // Set multi-device sync mode to standalone to avoid depth/color timestamp differences
+            auto curConfig = my_dev->device->getMultiDeviceSyncConfig();
+            // Update the configuration items of the configuration file, and keep the original configuration for other items
+            VIAM_SDK_LOG(info) << "[configureDevice] Setting multi-device sync mode to standalone for device " << serialNumber
+                               << " with sync mode " << curConfig.syncMode << " to " << OB_MULTI_DEVICE_SYNC_MODE_STANDALONE;
+            curConfig.syncMode = OB_MULTI_DEVICE_SYNC_MODE_STANDALONE;
+            my_dev->device->setMultiDeviceSyncConfig(curConfig);
+        }
+    }
+
+    if (config == nullptr) {
+        std::ostringstream buffer;
+        buffer << service_name << ": unable to configure device " << serialNumber << " - no valid stream configuration found";
+        throw std::runtime_error(buffer.str());
+    }
+    my_dev->config = config;
+}
+
+void startDevice(std::string serialNumber, OrbbecModelConfig const& modelConfig) {
+    VIAM_SDK_LOG(info) << service_name << ": starting device " << serialNumber;
+    std::lock_guard<std::mutex> lock(devices_by_serial_mu());
+    auto search = devices_by_serial().find(serialNumber);
+    if (search == devices_by_serial().end()) {
+        std::ostringstream buffer;
+        buffer << service_name << ": unable to start undetected device" << serialNumber;
+        throw std::invalid_argument(buffer.str());
+    }
+
+    std::shared_ptr<ob::DeviceInfo> deviceInfo = search->second->device->getDeviceInfo();
+    if (deviceInfo == nullptr) {
+        std::ostringstream buffer;
+        buffer << service_name << ": unable to get device info for device " << serialNumber;
+        throw std::runtime_error(buffer.str());
+    }
+    std::string deviceName = deviceInfo->name();
+
+    VIAM_SDK_LOG(info) << "Device " << serialNumber << " is supported: " << deviceName;
+
+    std::unique_ptr<ViamOBDevice>& my_dev = search->second;
+    if (my_dev->started) {
+        std::ostringstream buffer;
+        buffer << service_name << ": device " << serialNumber << " is already started";
+        throw std::runtime_error(buffer.str());
+    }
+
+    // Start the pipeline with the configuration
+    my_dev->pipe->start(my_dev->config, frameCallback(serialNumber));
     my_dev->started = true;
-    VIAM_SDK_LOG(info) << service_name << ": device started " << serialNumber;
+    VIAM_SDK_LOG(info) << "Started pipeline for device " << serialNumber;
 }
 
 void stopDevice(std::string serialNumber, std::string resourceName) {
@@ -376,7 +934,12 @@ void stopDevice(std::string serialNumber, std::string resourceName) {
 
     std::unique_ptr<ViamOBDevice>& my_dev = search->second;
     if (!my_dev->started) {
-        VIAM_SDK_LOG(error) << service_name << ": unable to stop device that is not currently running " << serialNumber;
+        VIAM_SDK_LOG(warn) << service_name << ": device " << serialNumber << " was not running, cleaning up resource mapping";
+        // Clean up the resource mapping even if device wasn't running
+        {
+            std::lock_guard<std::mutex> lock(serial_by_resource_mu());
+            serial_by_resource().erase(resourceName);
+        }
         return;
     }
 
@@ -388,188 +951,290 @@ void stopDevice(std::string serialNumber, std::string resourceName) {
     }
 }
 
-void listDevices(const ob::Context& ctx) {
-    try {
-        auto devList = ctx.queryDeviceList();
-        int devCount = devList->getCount();
-        VIAM_SDK_LOG(info) << "devCount: " << devCount << "\n";
-
-        std::shared_ptr<ob::Device> dev = nullptr;
-        std::shared_ptr<ob::DeviceInfo> info = nullptr;
-        for (size_t i = 0; i < devCount; i++) {
-            dev = devList->getDevice(i);
-            info = dev->getDeviceInfo();
-            printDeviceInfo(info);
-            dev.reset();
-        }
-    } catch (ob::Error& e) {
-        std::cerr << "listDevices\n"
-                  << "function:" << e.getFunction() << "\nargs:" << e.getArgs() << "\nname:" << e.getName() << "\nmessage:" << e.what()
-                  << "\ntype:" << e.getExceptionType() << std::endl;
-        throw e;
-    }
-}
-
-raw_camera_image encodeDepthRAW(const unsigned char* data, const uint64_t width, const uint64_t height, const bool littleEndian) {
-    viam::sdk::Camera::depth_map m = xt::xarray<uint16_t>::from_shape({height, width});
-
-    auto depthPixels = boost::span{reinterpret_cast<uint16_t const*>(data), height * width};
-
-    std::transform(depthPixels.begin(), depthPixels.end(), m.begin(), [](uint16_t mi) { return mi * mmToMeterMultiple; });
-
-    std::vector<unsigned char> encodedData = viam::sdk::Camera::encode_depth_map(m);
-
-    raw_camera_image rawBuf(encodedData.size());
-
-    std::copy(encodedData.begin(), encodedData.end(), rawBuf.span().begin());
-
-    return rawBuf;
-}
-
 // HELPERS END
 
 // RESOURCE BEGIN
-std::vector<std::string> validate(vsdk::ResourceConfig cfg) {
-    auto attrs = cfg.attributes();
-
-    if (attrs.count("serial_number")) {
-        if (!attrs["serial_number"].get<std::string>()) {
-            throw std::invalid_argument("serial_number must be a string");
-        }
+void Orbbec::validate_sensor(std::pair<std::string, viam::sdk::ProtoValue> const& sensor_pair, const OrbbecModelConfig& modelConfig) {
+    auto const& sensor_type = sensor_pair.first;
+    auto const& sensor = sensor_pair.second.get<viam::sdk::ProtoStruct>();
+    if (!sensor) {
+        throw std::invalid_argument("sensor must be a struct");
     }
-    return {};
-}
-
-Orbbec::Orbbec(vsdk::Dependencies deps, vsdk::ResourceConfig cfg)
-    : Camera(cfg.name()), config_(configure_(std::move(deps), std::move(cfg))) {
-    VIAM_SDK_LOG(info) << "Orbbec constructor start " << config_->serial_number;
-    startDevice(config_->serial_number, config_->resource_name);
-    {
-        std::lock_guard<std::mutex> lock(serial_by_resource_mu());
-        serial_by_resource()[config_->resource_name] = config_->serial_number;
+    if (!sensor->count(kAttrWidth)) {
+        throw std::invalid_argument("sensor must contain width key");
     }
-    VIAM_SDK_LOG(info) << "Orbbec constructor end " << config_->serial_number;
-}
-
-Orbbec::~Orbbec() {
-    if (config_ == nullptr) {
-        VIAM_SDK_LOG(error) << "Orbbec destructor start: config_ is null, no available serial number";
-    } else {
-        VIAM_SDK_LOG(info) << "Orbbec destructor start " << config_->serial_number;
+    auto width = sensor->at(kAttrWidth).get<double>();
+    if (!width) {
+        throw std::invalid_argument("sensor width must be a double");
     }
-    std::string prev_serial_number;
-    std::string prev_resource_name;
-    {
-        const std::lock_guard<std::mutex> lock(config_mu_);
-        prev_serial_number = config_->serial_number;
-        prev_resource_name = config_->resource_name;
+    if (*width <= 0) {
+        throw std::invalid_argument("sensor width must be positive");
     }
-    stopDevice(prev_serial_number, prev_resource_name);
-    if (config_ == nullptr) {
-        VIAM_SDK_LOG(error) << "Orbbec destructor end: config_ is null, no available serial number";
-    } else {
-        VIAM_SDK_LOG(info) << "Orbbec destructor end " << config_->serial_number;
+    if (!sensor->count(kAttrHeight)) {
+        throw std::invalid_argument("sensor must contain height key");
     }
-}
-
-void Orbbec::reconfigure(const vsdk::Dependencies& deps, const vsdk::ResourceConfig& cfg) {
-    VIAM_SDK_LOG(info) << "Orbbec reconfigure start";
-    std::string prev_serial_number;
-    std::string prev_resource_name;
-    {
-        const std::lock_guard<std::mutex> lock(config_mu_);
-        prev_serial_number = config_->serial_number;
-        prev_resource_name = config_->resource_name;
+    auto height = sensor->at(kAttrHeight).get<double>();
+    if (!height) {
+        throw std::invalid_argument("sensor height must be a double");
     }
-    stopDevice(prev_serial_number, prev_resource_name);
-    std::string new_serial_number;
-    std::string new_resource_name;
-    {
-        const std::lock_guard<std::mutex> lock(config_mu_);
-        config_.reset();
-        config_ = configure_(deps, cfg);
-        new_serial_number = config_->serial_number;
-        new_resource_name = config_->resource_name;
+    if (*height <= 0) {
+        throw std::invalid_argument("sensor height must be positive");
     }
-    startDevice(new_serial_number, new_resource_name);
-    {
-        std::lock_guard<std::mutex> lock(serial_by_resource_mu());
-        serial_by_resource()[config_->resource_name] = new_serial_number;
+    auto const format = sensor->at(kAttrFormat).get<std::string>();
+    if (!format) {
+        throw std::invalid_argument("sensor format must be a string");
     }
-    VIAM_SDK_LOG(info) << "Orbbec reconfigure end";
-}
-
-vsdk::Camera::raw_image Orbbec::get_image(std::string mime_type, const vsdk::ProtoStruct& extra) {
-    try {
-        VIAM_SDK_LOG(info) << "[get_image] start";
-        std::string serial_number;
-        {
-            const std::lock_guard<std::mutex> lock(config_mu_);
-            serial_number = config_->serial_number;
-        }
-        std::shared_ptr<ob::FrameSet> fs = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(frame_set_by_serial_mu());
-            auto search = frame_set_by_serial().find(serial_number);
-            if (search == frame_set_by_serial().end()) {
-                throw std::invalid_argument("no frame yet");
-            }
-            fs = search->second;
-        }
-        std::shared_ptr<ob::Frame> color = fs->getFrame(OB_FRAME_COLOR);
-        if (color == nullptr) {
-            throw std::invalid_argument("no color frame");
-        }
-
-        if (color->getFormat() != OB_FORMAT_MJPG) {
-            throw std::invalid_argument("color frame was not in jpeg format");
-        }
-
-        // If the image's timestamp is older than a second throw error, this
-        // indicates we no longer have a working camera.
-        uint64_t nowUs = getNowUs();
-        uint64_t diff = timeSinceFrameUs(nowUs, color->getSystemTimeStampUs());
-        if (diff > maxFrameAgeUs) {
+    if (sensor_type == kColorSourceName) {
+        if (!modelConfig.supported_color_formats.count(*format)) {
             std::ostringstream buffer;
-            buffer << "no recent color frame: check USB connection, diff: " << diff << "us";
+            buffer << "color sensor format must be one of: ";
+            for (const auto& type : modelConfig.supported_color_formats) {
+                buffer << type << " ";
+            }
+            VIAM_SDK_LOG(error) << buffer.str();
             throw std::invalid_argument(buffer.str());
         }
 
-        unsigned char* colorData = (unsigned char*)color->getData();
-        if (colorData == nullptr) {
-            throw std::runtime_error("[get_image] color data is null");
+    } else if (sensor_type == kDepthSourceName) {
+        if (!modelConfig.supported_depth_formats.count(*format)) {
+            std::ostringstream buffer;
+            buffer << "depth sensor format must be one of: ";
+            for (const auto& type : modelConfig.supported_depth_formats) {
+                buffer << type << " ";
+            }
+            VIAM_SDK_LOG(error) << buffer.str();
+            throw std::invalid_argument(buffer.str());
         }
-        uint32_t colorDataSize = color->dataSize();
-
-        vsdk::Camera::raw_image response;
-        response.source_name = kColorSourceName;
-        response.mime_type = kColorMimeTypeJPEG;
-        response.bytes.assign(colorData, colorData + colorDataSize);
-        VIAM_SDK_LOG(info) << "[get_image] end";
-        return response;
-    } catch (const std::exception& e) {
-        VIAM_SDK_LOG(error) << "[get_image] error: " << e.what();
-        throw std::runtime_error("failed to create image: " + std::string(e.what()));
+    } else {
+        throw std::invalid_argument("sensor type must be color or depth");
     }
+}
+
+std::vector<std::string> Orbbec::validateOrbbecModel(vsdk::ResourceConfig cfg, OrbbecModelConfig const& modelConfig) {
+    auto attrs = cfg.attributes();
+
+    if (!attrs.count(kAttrSerialNumber)) {
+        throw std::invalid_argument("serial_number is a required argument");
+    }
+
+    if (!attrs[kAttrSerialNumber].get<std::string>()) {
+        throw std::invalid_argument("serial_number must be a string");
+    }
+
+    // We already established this is a string, so it's safe to call this
+    std::string const serial = attrs[kAttrSerialNumber].get_unchecked<std::string>();
+    if (serial.empty()) {
+        throw std::invalid_argument("serial_number must be a non-empty string");
+    }
+
+    if (attrs.count(kAttrSensors)) {
+        auto sensors = attrs[kAttrSensors].get<viam::sdk::ProtoStruct>();
+        if (!sensors) {
+            throw std::invalid_argument("sensors must be a struct");
+        }
+        if (sensors) {
+            for (auto const& sensor_pair : *sensors) {
+                validate_sensor(sensor_pair, modelConfig);
+            }
+        }
+        auto color_width_uint32 =
+            static_cast<std::uint32_t>(*sensors->at(kColorSourceName).get<viam::sdk::ProtoStruct>()->at(kAttrWidth).get<double>());
+        auto color_height_uint32 =
+            static_cast<std::uint32_t>(*sensors->at(kColorSourceName).get<viam::sdk::ProtoStruct>()->at(kAttrHeight).get<double>());
+        if (modelConfig.color_to_depth_supported_resolutions.count({color_width_uint32, color_height_uint32}) == 0) {
+            std::ostringstream buffer;
+            buffer << "color resolution must be one of: ";
+            for (const auto& res : modelConfig.color_to_depth_supported_resolutions) {
+                buffer << "{" << res.first.to_string() << "} ";
+            }
+            VIAM_SDK_LOG(error) << buffer.str();
+            throw std::invalid_argument(buffer.str());
+        }
+        auto depth_width_uint32 =
+            static_cast<std::uint32_t>(*sensors->at(kDepthSourceName).get<viam::sdk::ProtoStruct>()->at(kAttrWidth).get<double>());
+        auto depth_height_uint32 =
+            static_cast<std::uint32_t>(*sensors->at(kDepthSourceName).get<viam::sdk::ProtoStruct>()->at(kAttrHeight).get<double>());
+        if (modelConfig.color_to_depth_supported_resolutions.at({color_width_uint32, color_height_uint32})
+                .count({depth_width_uint32, depth_height_uint32}) == 0) {
+            std::ostringstream buffer;
+            buffer << "color/depth resolution combination not supported, for color resolution " << "{" << color_width_uint32 << ", "
+                   << color_height_uint32 << "}, depth resolution must be one of: ";
+            for (const auto& res : modelConfig.color_to_depth_supported_resolutions.at({color_width_uint32, color_height_uint32})) {
+                buffer << "{" << res.to_string() << "} ";
+            }
+            VIAM_SDK_LOG(error) << buffer.str();
+            throw std::invalid_argument(buffer.str());
+        }
+    }
+
+    return {};
+}
+
+std::vector<std::string> Orbbec::validateAstra2(vsdk::ResourceConfig cfg) {
+    return validateOrbbecModel(cfg, ASTRA2_CONFIG);
+}
+
+std::vector<std::string> Orbbec::validateGemini335Le(vsdk::ResourceConfig cfg) {
+#if !defined(__linux__)
+    return {"viam:orbbec:gemini_335le is only supported on Linux hosts"};
+#else
+    return validateOrbbecModel(cfg, GEMINI_335LE_CONFIG);
+#endif
+}
+
+std::string getSerialNumber(const vsdk::ResourceConfig& cfg) {
+    auto attrs = cfg.attributes();
+    if (attrs.count(kAttrSerialNumber)) {
+        auto serial = attrs.at(kAttrSerialNumber).get<std::string>();
+        if (serial) {
+            return *serial;
+        }
+    }
+    throw std::invalid_argument("serial_number is a required argument");
+}
+
+void applyExperimentalConfig(std::unique_ptr<ViamOBDevice>& my_dev, vsdk::ProtoStruct const& config) {
+    if (config.count("device_properties") > 0) {
+        auto device_properties = config.at("device_properties").get<vsdk::ProtoStruct>();
+        if (device_properties) {
+            device_control::setDeviceProperties(my_dev->device, *device_properties, "Orbbec Constructor");
+            VIAM_SDK_LOG(info) << "[applyExperimentalConfig] device_properties applied";
+        }
+    }
+    if (config.count("post_process_depth_filters") > 0) {
+        auto filters = config.at("post_process_depth_filters").get<vsdk::ProtoStruct>();
+        if (filters) {
+            device_control::setPostProcessDepthFilters(my_dev->postProcessDepthFilters, *filters, "Orbbec Constructor");
+            VIAM_SDK_LOG(info) << "[applyExperimentalConfig] postProcessDepthFilters:  "
+                               << device_control::postProcessDepthFiltersToString(my_dev->postProcessDepthFilters);
+        }
+    }
+    if (config.count("apply_post_process_depth_filters") > 0) {
+        auto apply_filters = config.at("apply_post_process_depth_filters").get<bool>();
+        if (apply_filters) {
+            device_control::applyPostProcessDepthFilters(my_dev, *apply_filters, "Orbbec Constructor");
+            VIAM_SDK_LOG(info) << "[applyExperimentalConfig] apply_post_process_depth_filters: "
+                               << my_dev->applyEnabledPostProcessDepthFilters;
+        }
+    }
+}
+
+Orbbec::Orbbec(vsdk::Dependencies deps, vsdk::ResourceConfig cfg, std::shared_ptr<ob::Context> ctx)
+    : Camera(cfg.name()), serial_number_(getSerialNumber(cfg)), ob_ctx_(std::move(ctx)) {
+    VIAM_RESOURCE_LOG(info) << "Orbbec constructor start " << serial_number_;
+    auto config = configure(deps, cfg);
+    {
+        std::lock_guard<std::mutex> lock(config_by_serial_mu());
+        config_by_serial().insert_or_assign(serial_number_, *config);
+        VIAM_RESOURCE_LOG(info) << "initial config_by_serial_: " << config_by_serial().at(serial_number_).to_string();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(devices_by_serial_mu());
+        auto search = devices_by_serial().find(serial_number_);
+        if (search == devices_by_serial().end()) {
+            std::ostringstream buffer;
+            buffer << service_name << ": unable to start undetected device" << serial_number_;
+            throw std::invalid_argument(buffer.str());
+        }
+        std::unique_ptr<ViamOBDevice>& my_dev = search->second;
+        applyExperimentalConfig(my_dev, cfg.attributes());
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(devices_by_serial_mu());
+        auto search = devices_by_serial().find(serial_number_);
+        if (search != devices_by_serial().end()) {
+            firmware_version_ = search->second->device->getDeviceInfo()->firmwareVersion();
+
+            // Detect model and set model_config_
+            std::shared_ptr<ob::DeviceInfo> deviceInfo = search->second->device->getDeviceInfo();
+            model_config_ = OrbbecModelConfig::forDevice(deviceInfo->name());
+            VIAM_SDK_LOG(info) << "Detected model: " << model_config_->viam_model_suffix;
+        }
+    }
+
+    if (!model_config_.has_value()) {
+        throw std::runtime_error("Failed to detect Orbbec model configuration");
+    }
+
+    configureDevice(serial_number_, model_config_.value());
+    startDevice(serial_number_, model_config_.value());
+    {
+        std::lock_guard<std::mutex> lock(serial_by_resource_mu());
+        serial_by_resource()[config->resource_name] = serial_number_;
+    }
+
+    VIAM_RESOURCE_LOG(info) << "Orbbec constructor end " << serial_number_;
+}
+
+Orbbec::~Orbbec() {
+    VIAM_RESOURCE_LOG(info) << "Orbbec destructor start " << serial_number_;
+    std::string prev_serial_number;
+    std::string prev_resource_name;
+    {
+        const std::lock_guard<std::mutex> lock(config_by_serial_mu());
+        if (config_by_serial().count(serial_number_) == 0) {
+            VIAM_RESOURCE_LOG(error) << "Orbbec destructor: device with serial number " << serial_number_
+                                     << " is not in config_by_serial, skipping erase";
+        } else {
+            prev_serial_number = config_by_serial().at(serial_number_).serial_number;
+            prev_resource_name = config_by_serial().at(serial_number_).resource_name;
+            config_by_serial().erase(serial_number_);
+        }
+    }
+    stopDevice(prev_serial_number, prev_resource_name);
+
+    // Drop any frame captured before this teardown. viam-server rebuilds the resource on a config
+    // change, so leaving one here lets the replacement instance find a frame from the previous
+    // configuration: the staleness check then reports "no recent frame: check connection" rather
+    // than the frames simply not having arrived yet (RSDK-11302). This has to run after stopDevice,
+    // which stops the pipeline, so that no further frames can land after the erase.
+    {
+        const std::lock_guard<std::mutex> lock(frame_set_by_serial_mu());
+        frame_set_by_serial().erase(serial_number_);
+    }
+
+    VIAM_RESOURCE_LOG(info) << "Orbbec destructor end " << serial_number_;
+}
+
+vsdk::ProtoStruct Orbbec::get_status() {
+    std::string serial_number;
+    {
+        const std::lock_guard<std::mutex> lock(serial_number_mu_);
+        serial_number = serial_number_;
+    }
+
+    bool started = false;
+    {
+        const std::lock_guard<std::mutex> lock(devices_by_serial_mu());
+        auto search = devices_by_serial().find(serial_number);
+        if (search != devices_by_serial().end()) {
+            started = search->second->started;
+        }
+    }
+
+    return vsdk::ProtoStruct{{"serial_number", serial_number},
+                             {"model", model_config_.has_value() ? model_config_->viam_model_suffix : std::string{}},
+                             {"firmware_version", firmware_version_},
+                             {"streaming", started}};
 }
 
 vsdk::Camera::properties Orbbec::get_properties() {
     try {
-        VIAM_SDK_LOG(info) << "[get_properties] start";
+        VIAM_RESOURCE_LOG(debug) << "[get_properties] start";
 
         std::string serial_number;
         {
-            const std::lock_guard<std::mutex> lock(config_mu_);
-            if (config_ == nullptr) {
-                throw std::runtime_error("native config is null");
+            const std::lock_guard<std::mutex> lock(serial_number_mu_);
+            if (serial_number_.empty()) {
+                throw std::runtime_error("serial number is null");
             }
-            if (config_->serial_number.empty()) {
-                throw std::runtime_error("native config serial number is empty");
-            }
-            serial_number = config_->serial_number;
+            serial_number = serial_number_;
         }
 
-        OBCameraIntrinsic props;
+        OBCameraIntrinsic intrinsic_props;
+        OBCameraDistortion distortion_props;
         {
             const std::lock_guard<std::mutex> lock(devices_by_serial_mu());
             auto search = devices_by_serial().find(serial_number);
@@ -582,136 +1247,379 @@ vsdk::Camera::properties Orbbec::get_properties() {
             std::unique_ptr<ViamOBDevice>& my_dev = search->second;
             if (!my_dev->started) {
                 std::ostringstream buffer;
-                buffer << service_name << ": device with serial number " << serial_number << " is not longer started";
+                buffer << service_name << ": device with serial number " << serial_number << " is not started";
                 throw std::invalid_argument(buffer.str());
             }
-            props = my_dev->pipe->getCameraParam().rgbIntrinsic;
+            auto const camera_params = my_dev->pipe->getCameraParam();
+            intrinsic_props = camera_params.rgbIntrinsic;
+            distortion_props = camera_params.rgbDistortion;
         }
 
         vsdk::Camera::properties p{};
         p.supports_pcd = true;
-        p.intrinsic_parameters.width_px = props.width;
-        p.intrinsic_parameters.height_px = props.height;
-        p.intrinsic_parameters.focal_x_px = props.fx;
-        p.intrinsic_parameters.focal_y_px = props.fy;
-        p.intrinsic_parameters.center_x_px = props.cx;
-        p.intrinsic_parameters.center_y_px = props.cy;
-        // TODO: Set distortion parameters
+        p.default_reference_frame = name();
+        p.intrinsic_parameters.width_px = intrinsic_props.width;
+        p.intrinsic_parameters.height_px = intrinsic_props.height;
+        p.intrinsic_parameters.focal_x_px = intrinsic_props.fx;
+        p.intrinsic_parameters.focal_y_px = intrinsic_props.fy;
+        p.intrinsic_parameters.center_x_px = intrinsic_props.cx;
+        p.intrinsic_parameters.center_y_px = intrinsic_props.cy;
+        p.distortion_parameters.model = device_control::distortionTypeToString(distortion_props.model);
 
-        VIAM_SDK_LOG(info) << "[get_properties] end";
+        if (distortion_props.model == OB_DISTORTION_BROWN_CONRADY_K6) {
+            // TODO: These should be named parameters in the struct, not relying on order
+            // If this is ever changed, make sure to update the README
+
+            /*
+            Brown-Conrady K6 distortion model in RDK: rimage/transform/brown_conrady_k6.go
+            Written here to display the correct order of parameters
+            type BrownConradyK6 struct {
+            RadialK1     float64 `json:"rk1"`
+            RadialK2     float64 `json:"rk2"`
+            RadialK3     float64 `json:"rk3"`
+            RadialK4     float64 `json:"rk4"`
+            RadialK5     float64 `json:"rk5"`
+            RadialK6     float64 `json:"rk6"`
+            TangentialP1 float64 `json:"tp1"`
+            TangentialP2 float64 `json:"tp2"`
+            }
+            */
+            p.distortion_parameters.parameters = std::vector<double>{distortion_props.k1,
+                                                                     distortion_props.k2,
+                                                                     distortion_props.k3,
+                                                                     distortion_props.k4,
+                                                                     distortion_props.k5,
+                                                                     distortion_props.k6,
+                                                                     distortion_props.p1,
+                                                                     distortion_props.p2};
+        } else {
+            throw std::runtime_error("Unsupported distortion model: " + device_control::distortionTypeToString(distortion_props.model));
+        }
+
+        std::stringstream properties_ss;
+        properties_ss << "distortion parameters: [model: " << p.distortion_parameters.model << ", parameters: [";
+        for (const auto& param : p.distortion_parameters.parameters) {
+            properties_ss << param << ", ";
+        }
+        properties_ss << "]], intrinsic parameters: [";
+        properties_ss << p.intrinsic_parameters.width_px << ", " << p.intrinsic_parameters.height_px << ", "
+                      << p.intrinsic_parameters.focal_x_px << ", " << p.intrinsic_parameters.focal_y_px << ", "
+                      << p.intrinsic_parameters.center_x_px << ", " << p.intrinsic_parameters.center_y_px << "]";
+        VIAM_RESOURCE_LOG(debug) << "[get_properties] Properties: " << properties_ss.str();
+
+        VIAM_RESOURCE_LOG(debug) << "[get_properties] end";
         return p;
     } catch (const std::exception& e) {
-        VIAM_SDK_LOG(error) << "[get_properties] error: " << e.what();
+        VIAM_RESOURCE_LOG(error) << "[get_properties] error: " << e.what();
         throw std::runtime_error("failed to create properties: " + std::string(e.what()));
     }
 }
 
-vsdk::Camera::image_collection Orbbec::get_images() {
+vsdk::Camera::image_collection Orbbec::get_images(std::vector<std::string> filter_source_names, const vsdk::ProtoStruct& extra) {
     try {
-        VIAM_SDK_LOG(info) << "[get_images] start";
+        VIAM_RESOURCE_LOG(debug) << "[get_images] start";
         std::string serial_number;
         {
-            const std::lock_guard<std::mutex> lock(config_mu_);
-            serial_number = config_->serial_number;
+            const std::lock_guard<std::mutex> lock(serial_number_mu_);
+            serial_number = serial_number_;
         }
+
+        if (model_config_.has_value()) {
+            checkFirmwareVersion(firmware_version_, model_config_->min_firmware_version, model_config_->viam_model_suffix);
+        }
+
         std::shared_ptr<ob::FrameSet> fs = nullptr;
         {
             std::lock_guard<std::mutex> lock(frame_set_by_serial_mu());
             auto search = frame_set_by_serial().find(serial_number);
             if (search == frame_set_by_serial().end()) {
-                throw std::invalid_argument("no frame yet");
+                std::string errorMsg = "no frame yet";
+                {
+                    std::lock_guard<std::mutex> devLock(devices_by_serial_mu());
+                    auto devSearch = devices_by_serial().find(serial_number);
+                    if (devSearch != devices_by_serial().end()) {
+                        std::string usbWarning = buildUsbSpeedWarning(devSearch->second->device->getDeviceInfo());
+                        if (!usbWarning.empty()) {
+                            errorMsg += ": " + usbWarning;
+                        }
+                    }
+                }
+                throw std::runtime_error(errorMsg);
             }
             fs = search->second;
         }
-
-        std::shared_ptr<ob::Frame> color = fs->getFrame(OB_FRAME_COLOR);
-        if (color == nullptr) {
-            throw std::invalid_argument("no color frame");
+        if (fs == nullptr) {
+            throw std::runtime_error("no frameset");
         }
 
-        uint64_t nowUs = getNowUs();
-        uint64_t diff = timeSinceFrameUs(nowUs, color->getSystemTimeStampUs());
-        if (diff > maxFrameAgeUs) {
-            std::ostringstream buffer;
-            buffer << "no recent color frame: check USB connection, diff: " << diff << "us";
-            throw std::invalid_argument(buffer.str());
+        bool should_process_color = false;
+        bool should_process_depth = false;
+
+        if (filter_source_names.empty()) {
+            should_process_color = true;
+            should_process_depth = true;
+        } else {
+            for (const auto& name : filter_source_names) {
+                if (name == kColorSourceName) {
+                    should_process_color = true;
+                }
+                if (name == kDepthSourceName) {
+                    should_process_depth = true;
+                }
+            }
         }
-
-        if (color->getFormat() != OB_FORMAT_MJPG) {
-            throw std::invalid_argument("color frame was not in jpeg format");
-        }
-
-        std::shared_ptr<ob::Frame> depth = fs->getFrame(OB_FRAME_DEPTH);
-        if (depth == nullptr) {
-            throw std::invalid_argument("no depth frame");
-        }
-
-        diff = timeSinceFrameUs(nowUs, depth->getSystemTimeStampUs());
-        if (diff > maxFrameAgeUs) {
-            std::ostringstream buffer;
-            buffer << "no recent depth frame: check USB connection, diff: " << diff << "us";
-        }
-
-        unsigned char* colorData = (unsigned char*)color->getData();
-        if (colorData == nullptr) {
-            throw std::runtime_error("[get_image] color data is null");
-        }
-        uint32_t colorDataSize = color->dataSize();
-
-        vsdk::Camera::raw_image color_image;
-        color_image.source_name = kColorSourceName;
-        color_image.mime_type = kColorMimeTypeJPEG;
-        color_image.bytes.assign(colorData, colorData + colorDataSize);
-
-        unsigned char* depthData = (unsigned char*)depth->getData();
-        if (depthData == nullptr) {
-            throw std::runtime_error("[get_images] depth data is null");
-        }
-        auto depthVid = depth->as<ob::VideoFrame>();
-        raw_camera_image rci = encodeDepthRAW(depthData, depthVid->getWidth(), depthVid->getHeight(), false);
-
-        vsdk::Camera::raw_image depth_image;
-        depth_image.source_name = kDepthSourceName;
-        depth_image.mime_type = kDepthMimeTypeViamDep;
-        depth_image.bytes.assign(rci.span().begin(), rci.span().end());
 
         vsdk::Camera::image_collection response;
-        response.images.emplace_back(std::move(color_image));
-        response.images.emplace_back(std::move(depth_image));
-
-        uint64_t colorTS = color->getSystemTimeStampUs();
-        uint64_t depthTS = depth->getSystemTimeStampUs();
-        if (colorTS != depthTS) {
-            VIAM_SDK_LOG(info) << "color and depth timestamps differ, defaulting to "
-                                  "older of the two"
-                               << "color timestamp was " << colorTS << " depth timestamp was " << depthTS;
+        std::shared_ptr<ob::Frame> color = nullptr;
+        std::shared_ptr<ob::Frame> depth = nullptr;
+        uint64_t nowUs = getNowUs();
+        std::optional<DeviceFormat> device_format_opt;
+        {
+            std::lock_guard<std::mutex> lock(config_by_serial_mu());
+            if (config_by_serial().count(serial_number) == 0) {
+                throw std::runtime_error("device with serial number " + serial_number + " is not in config_by_serial");
+            }
+            device_format_opt = config_by_serial().at(serial_number).device_format;
         }
-        // use the older of the two timestamps
-        uint64_t timestamp = (colorTS > depthTS) ? depthTS : colorTS;
 
-        std::chrono::microseconds latestTimestamp(timestamp);
-        response.metadata.captured_at = vsdk::time_pt{std::chrono::duration_cast<std::chrono::nanoseconds>(latestTimestamp)};
-        VIAM_SDK_LOG(info) << "[get_images] end";
+        if (should_process_color) {
+            color = fs->getFrame(OB_FRAME_COLOR);
+            validateColorFrame(color, device_format_opt, *model_config_);
+
+            vsdk::Camera::raw_image color_image = encodeColorFrame(color);
+            color_image.source_name = kColorSourceName;
+            response.images.emplace_back(std::move(color_image));
+        }
+
+        if (should_process_depth) {
+            depth = fs->getFrame(OB_FRAME_DEPTH);
+            validateDepthFrame(depth, device_format_opt, *model_config_);
+
+            unsigned char* depthData = (unsigned char*)depth->getData();
+            if (depthData == nullptr) {
+                throw std::runtime_error("[get_images] depth data is null");
+            }
+            auto depthVid = depth->as<ob::VideoFrame>();
+            float valueScale = depth->as<ob::DepthFrame>()->getValueScale();
+
+            vsdk::Camera::raw_image depth_image;
+            depth_image.source_name = kDepthSourceName;
+            depth_image.mime_type = kDepthMimeTypeViamDep;
+            depth_image.bytes = encoding::encode_to_depth_raw(depthData, depthVid->getWidth(), depthVid->getHeight(), valueScale);
+            response.images.emplace_back(std::move(depth_image));
+        }
+
+        if (response.images.empty()) {
+            VIAM_RESOURCE_LOG(error) << "[get_images] error: no camera sources matched the filter";
+            return response;
+        }
+
+        uint64_t const colorTSUs = color ? getBestTimestampUs(color) : 0;
+        uint64_t const depthTSUs = depth ? getBestTimestampUs(depth) : 0;
+        uint64_t const timeDiff = (colorTSUs > depthTSUs) ? colorTSUs - depthTSUs : depthTSUs - colorTSUs;
+        uint64_t timestampUs = 0;
+
+        if (colorTSUs > 0 && depthTSUs > 0 && timeDiff > maxFrameSetTimeDiffUs) {
+            // Always log at debug level
+            VIAM_RESOURCE_LOG(debug) << "color and depth timestamps differ, "
+                                     << "color: " << colorTSUs << " depth: " << depthTSUs << ", diff: " << timeDiff << "us";
+
+            // Throttled info-level logging
+            uint64_t lastTimestampLogTime = 0;
+            {
+                std::lock_guard<std::mutex> lock(devices_by_serial_mu());
+                auto search = devices_by_serial().find(serial_number);
+                if (search != devices_by_serial().end()) {
+                    lastTimestampLogTime = search->second->lastTimestampLogTime;
+                }
+            }
+            uint64_t nowUs =
+                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            if (nowUs - lastTimestampLogTime > timestampWarningLogIntervalUs) {
+                VIAM_RESOURCE_LOG(warn) << "color and depth timestamps differ by " << timeDiff << "us, using older timestamp. "
+                                        << "(This warning throttled to once per 60s; see debug for all occurrences)";
+                {
+                    std::lock_guard<std::mutex> lock(devices_by_serial_mu());
+                    auto search = devices_by_serial().find(serial_number);
+                    if (search != devices_by_serial().end()) {
+                        search->second->lastTimestampLogTime = nowUs;
+                    }
+                }
+            }
+            // use the older of the two timestamps
+            timestampUs = (colorTSUs > depthTSUs) ? depthTSUs : colorTSUs;
+        } else if (colorTSUs > 0) {
+            timestampUs = colorTSUs;
+        } else {
+            timestampUs = depthTSUs;
+        }
+
+        std::chrono::microseconds latestTimestampUs(timestampUs);
+        response.metadata.captured_at = vsdk::time_pt{std::chrono::duration_cast<std::chrono::nanoseconds>(latestTimestampUs)};
+        VIAM_RESOURCE_LOG(debug) << "[get_images] end";
         return response;
     } catch (const std::exception& e) {
-        VIAM_SDK_LOG(error) << "[get_images] error: " << e.what();
+        VIAM_RESOURCE_LOG(error) << "[get_images] error: " << e.what();
         throw std::runtime_error("failed to create images: " + std::string(e.what()));
     }
 }
 
 vsdk::ProtoStruct Orbbec::do_command(const vsdk::ProtoStruct& command) {
-    VIAM_SDK_LOG(error) << "do_command not implemented";
+    if (command.empty()) {
+        return vsdk::ProtoStruct{{"error", std::string("empty command")}};
+    }
+    bool call_get_properties = false;
+    try {
+        constexpr char firmware_key[] = "update_firmware";
+        std::string serial_number;
+        {
+            const std::lock_guard<std::mutex> lock(serial_number_mu_);
+            serial_number = serial_number_;
+        }
+        {
+            // note: under lock for the entire firmware update to ensure device can't be destructed.
+            const std::lock_guard<std::mutex> lock(devices_by_serial_mu());
+            auto search = devices_by_serial().find(serial_number);
+            if (search == devices_by_serial().end()) {
+                VIAM_RESOURCE_LOG(error) << "[do_command] device is not connected";
+                return vsdk::ProtoStruct{{"error", std::string("device is not connected")}};
+            }
+
+            std::unique_ptr<ViamOBDevice>& dev = search->second;
+            for (auto const& [key, value] : command) {
+                if (key == firmware_key) {
+                    VIAM_RESOURCE_LOG(info) << "Received firmware update command";
+                    vsdk::ProtoStruct resp = viam::sdk::ProtoStruct{};
+                    if (!model_config_.has_value()) {
+                        throw std::runtime_error("Model configuration not available for firmware update");
+                    }
+                    if (firmware_version_.find(model_config_->min_firmware_version) != std::string::npos) {
+                        std::ostringstream buffer;
+                        buffer << "Device firmware already on version " << model_config_->min_firmware_version;
+                        resp.emplace(firmware_key, buffer.str());
+                        VIAM_RESOURCE_LOG(info) << buffer.str();
+                        return resp;
+                    }
+                    VIAM_RESOURCE_LOG(info) << "Updating device firmware...";
+                    if (dev->started) {
+                        dev->pipe->stop();
+                        dev->started = false;
+                    }
+
+                    try {
+                        if (model_config_->firmware_url.has_value()) {
+                            VIAM_RESOURCE_LOG(info) << "Updating device firmware from URL: " << model_config_->firmware_url.value();
+                            firmware::updateFirmware(dev, ob_ctx_, model_config_->firmware_url.value(), logger_);
+                        } else {
+                            throw std::runtime_error("Firmware update not supported for this model");
+                        }
+                        firmware_version_ = model_config_->min_firmware_version;
+                    } catch (const std::exception& e) {
+                        std::ostringstream buffer;
+                        buffer << "firmware update failed: " << e.what();
+                        VIAM_RESOURCE_LOG(error) << buffer.str();
+                        resp.emplace(firmware_key, buffer.str());
+                        dev->pipe->start(dev->config, frameCallback(serial_number));
+                        dev->started = true;
+                    }
+// macOS has a bug where the device changed callback is not called on reboot, so user must manually reboot the device
+#if defined(__linux__)
+                    dev->device->reboot();
+                    resp.emplace(firmware_key, std::string("firmware successfully updated"));
+#else
+                    resp.emplace(firmware_key, std::string("firmware successfully updated, unplug and replug the device"));
+#endif
+                    return resp;
+                } else if (key == "dump_pcl_files") {
+                    if (!value.is_a<bool>()) {
+                        VIAM_RESOURCE_LOG(error) << "[do_command] dump_pcl_files: expected bool, got " << value.kind();
+                        return vsdk::ProtoStruct{{"error", "expected bool"}};
+                    }
+                    dev->dumpPCLFiles = value.get_unchecked<bool>();
+                    return {{"dump_pcl_files", dev->dumpPCLFiles}};
+                } else if (key == "apply_post_process_depth_filters") {
+                    return device_control::applyPostProcessDepthFilters(dev, value, key);
+                } else if (key == "get_recommended_post_process_depth_filters") {
+                    return device_control::getRecommendedPostProcessDepthFilters(dev->device);
+                } else if (key == "set_recommended_post_process_depth_filters") {
+                    return device_control::setRecommendedPostProcessDepthFilters(dev);
+                } else if (key == "get_post_process_depth_filters") {
+                    return device_control::getPostProcessDepthFilters(dev->postProcessDepthFilters, key);
+                } else if (key == "set_post_process_depth_filters") {
+                    return device_control::setPostProcessDepthFilters(dev->postProcessDepthFilters, value, key);
+                } else if (key == "get_depth_unit") {
+                    return device_control::getDepthUnit(dev->device, key);
+                } else if (key == "set_depth_unit") {
+                    return device_control::setDepthUnit(dev->device, value, key);
+                } else if (key == "get_device_properties") {
+                    return device_control::getDeviceProperties(dev->device, key);
+                } else if (key == "set_device_properties") {
+                    return device_control::setDeviceProperties(dev->device, value, key);
+                } else if (key == "get_device_property") {
+                    return device_control::getDeviceProperty(dev->device, value, key);
+                } else if (key == "set_device_property") {
+                    return device_control::setDeviceProperty(dev->device, value, key);
+                } else if (key == "get_device_info") {
+                    return device_control::getDeviceInfo(dev->device, key);
+                } else if (key == "get_orbbec_sdk_version") {
+                    return device_control::getOrbbecSDKVersion(key);
+                } else if (key == "get_camera_params") {
+                    return device_control::getCameraParams<ob::Pipeline, ob::VideoStreamProfile>(dev->pipe);
+                } else if (key == "get_camera_temperature") {
+                    return device_control::getCameraTemperature(dev->device, key);
+                } else if (key == "create_module_config") {
+                    return device_control::createModuleConfig<ViamOBDevice, ob::VideoStreamProfile>(dev);
+                } else if (key == "call_get_properties") {
+                    call_get_properties = true;
+                } else {
+                    VIAM_RESOURCE_LOG(error) << "[do_command] unknown command: " << key;
+                    return vsdk::ProtoStruct{{"error", "unknown command: " + key}};
+                }
+            }
+        }  // unlock devices_by_serial_mu_
+        if (call_get_properties) {
+            VIAM_RESOURCE_LOG(info) << "[do_command] calling get_properties";
+            auto const props = get_properties();
+            VIAM_RESOURCE_LOG(info) << "[do_command] get_properties called";
+            vsdk::ProtoStruct resp;
+            resp["supports_pcd"] = props.supports_pcd;
+            resp["intrinsic_parameters"] = vsdk::ProtoStruct{{"width_px", props.intrinsic_parameters.width_px},
+                                                             {"height_px", props.intrinsic_parameters.height_px},
+                                                             {"focal_x_px", props.intrinsic_parameters.focal_x_px},
+                                                             {"focal_y_px", props.intrinsic_parameters.focal_y_px},
+                                                             {"center_x_px", props.intrinsic_parameters.center_x_px},
+                                                             {"center_y_px", props.intrinsic_parameters.center_y_px}};
+            vsdk::ProtoStruct distortion_params;
+            distortion_params["model"] = props.distortion_parameters.model;
+            std::vector<viam::sdk::ProtoValue> proto_params;
+            for (const auto& val : props.distortion_parameters.parameters) {
+                proto_params.emplace_back(val);  // Each double becomes a ProtoValue
+            }
+            distortion_params["parameters"] = viam::sdk::ProtoValue(proto_params);
+            resp["distortion_parameters"] = distortion_params;
+            VIAM_RESOURCE_LOG(info) << "[do_command] get_properties returning";
+            return resp;
+        }
+    } catch (const std::exception& e) {
+        VIAM_RESOURCE_LOG(error) << service_name << ": exception caught: " << e.what();
+        return vsdk::ProtoStruct{{"error", std::string(e.what())}};
+    }
     return vsdk::ProtoStruct{};
 }
 
 vsdk::Camera::point_cloud Orbbec::get_point_cloud(std::string mime_type, const vsdk::ProtoStruct& extra) {
     try {
-        VIAM_SDK_LOG(info) << "[get_point_cloud] start";
+        VIAM_RESOURCE_LOG(debug) << "[get_point_cloud] start";
         std::string serial_number;
         {
-            const std::lock_guard<std::mutex> lock(config_mu_);
-            serial_number = config_->serial_number;
+            const std::lock_guard<std::mutex> lock(serial_number_mu_);
+            serial_number = serial_number_;
         }
+
+        if (model_config_.has_value()) {
+            checkFirmwareVersion(firmware_version_, model_config_->min_firmware_version, model_config_->viam_model_suffix);
+        }
+
         std::shared_ptr<ob::FrameSet> fs = nullptr;
         {
             std::lock_guard<std::mutex> lock(frame_set_by_serial_mu());
@@ -723,40 +1631,21 @@ vsdk::Camera::point_cloud Orbbec::get_point_cloud(std::string mime_type, const v
         }
 
         std::shared_ptr<ob::Frame> color = fs->getFrame(OB_FRAME_COLOR);
-        if (color == nullptr) {
-            throw std::invalid_argument("no color frame");
-        }
-
-        uint64_t nowUs = getNowUs();
-        uint64_t diff = timeSinceFrameUs(nowUs, color->getSystemTimeStampUs());
-        if (diff > maxFrameAgeUs) {
-            std::ostringstream buffer;
-            buffer << "no recent color frame: check USB connection, diff: " << diff << "us";
-            throw std::invalid_argument(buffer.str());
-        }
-
         std::shared_ptr<ob::Frame> depth = fs->getFrame(OB_FRAME_DEPTH);
-        if (depth == nullptr) {
-            throw std::invalid_argument("no depth frame");
-        }
 
-        diff = timeSinceFrameUs(nowUs, depth->getSystemTimeStampUs());
-        if (diff > maxFrameAgeUs) {
-            std::ostringstream buffer;
-            buffer << "no recent depth frame: check USB connection, diff: " << diff << "us";
-            throw std::invalid_argument(buffer.str());
-        }
+        validateColorFrame(color, std::nullopt, *model_config_);
+        validateDepthFrame(depth, std::nullopt, *model_config_);
 
-        unsigned char* colorData = (unsigned char*)color->getData();
+        std::uint8_t* colorData = (std::uint8_t*)color->getData();
         if (colorData == nullptr) {
-            throw std::runtime_error("[get_image] color data is null");
+            throw std::runtime_error("[get_point_cloud] color data is null");
         }
-        uint32_t colorDataSize = color->dataSize();
+        std::uint32_t colorDataSize = color->dataSize();
 
         std::shared_ptr<ob::DepthFrame> depthFrame = depth->as<ob::DepthFrame>();
         float scale = depthFrame->getValueScale();
 
-        unsigned char* depthData = (unsigned char*)depth->getData();
+        std::uint8_t* depthData = (std::uint8_t*)depth->getData();
         if (depthData == nullptr) {
             throw std::runtime_error("[get_point_cloud] depth data is null");
         }
@@ -773,74 +1662,116 @@ vsdk::Camera::point_cloud Orbbec::get_point_cloud(std::string mime_type, const v
             throw std::invalid_argument("device is not started");
         }
 
-        std::vector<unsigned char> data =
-            RGBPointsToPCD(my_dev->pointCloudFilter->process(my_dev->align->process(fs)), scale * mmToMeterMultiple);
+        // If we have any post process depth filters configured, apply them now
+        if (my_dev->applyEnabledPostProcessDepthFilters && my_dev->postProcessDepthFilters.size() > 0) {
+            for (auto& filter : my_dev->postProcessDepthFilters) {
+                depth = filter->process(depth);
+            }
+            fs->pushFrame(depth);
+        }
 
-        VIAM_SDK_LOG(info) << "[get_point_cloud] end";
+        std::vector<unsigned char> data;
+        data = RGBPointsToPCD(my_dev->pointCloudFilter->process(my_dev->align->process(fs)), scale * mmToMeterMultiple);
+
+        // Write PCD to file if dumpPCLFiles is set
+        if (my_dev->dumpPCLFiles) {
+            auto timestamp = getNowUs();
+            // Get the path stored in the environment variable VIAM_MODULE_DATA
+            // If the environment variable is not set, use the current working directory
+            // to store the PCD file
+            std::stringstream outfile_name;
+            std::string viam_module_data = std::getenv("VIAM_MODULE_DATA");
+            if (!viam_module_data.empty()) {
+                std::filesystem::path dir_path(viam_module_data);
+                if (std::filesystem::exists(dir_path) && std::filesystem::is_directory(dir_path)) {
+                    outfile_name << viam_module_data << "/pointcloud_" << timestamp << ".pcd";
+                } else {
+                    VIAM_RESOURCE_LOG(warn) << "VIAM_MODULE_DATA is set to " << viam_module_data
+                                            << " but is not a valid directory, using current working directory to store PCD file";
+                    outfile_name << "pointcloud_" << timestamp << ".pcd";
+                }
+            } else {
+                VIAM_RESOURCE_LOG(warn) << "VIAM_MODULE_DATA is not set, using current working directory to store PCD file";
+                outfile_name << "pointcloud_" << timestamp << ".pcd";
+            }
+            std::ofstream outfile(outfile_name.str(), std::ios::out | std::ios::binary);
+            outfile.write((const char*)&data[0], data.size());
+
+            std::filesystem::path file_path(outfile_name.str());
+            std::filesystem::path absolute_path = std::filesystem::absolute(file_path);
+            std::string absolute_path_str = absolute_path.string();
+            outfile.close();
+            VIAM_RESOURCE_LOG(info) << "[get_point_cloud] wrote PCD to location: " << absolute_path_str;
+        }
+
+        VIAM_RESOURCE_LOG(debug) << "[get_point_cloud] end";
         return vsdk::Camera::point_cloud{kPcdMimeType, data};
     } catch (const std::exception& e) {
-        VIAM_SDK_LOG(error) << "[get_point_cloud] error: " << e.what();
+        VIAM_RESOURCE_LOG(error) << "[get_point_cloud] error: " << e.what();
         throw std::runtime_error("failed to create pointcloud: " + std::string(e.what()));
     }
 }
 
 std::vector<vsdk::GeometryConfig> Orbbec::get_geometries(const vsdk::ProtoStruct& extra) {
-    // see https://github.com/viam-modules/orbbec/pull/16 for explanation of geometry config values
-    // If we add support for models other than the astra 2 these values can't be hardcoded.
-    return {vsdk::GeometryConfig(vsdk::pose{-37.5, 5.5, -18.1}, vsdk::box({145, 46, 39}), "box")};
+    if (!model_config_.has_value()) {
+        throw std::runtime_error("failed to create geometries: no Orbbec model detected");
+    }
+    return {vsdk::GeometryConfig(model_config_->body_box_pose, model_config_->body_box, "box")};
 }
 
-std::unique_ptr<orbbec::ObResourceConfig> Orbbec::configure_(vsdk::Dependencies dependencies, vsdk::ResourceConfig configuration) {
+std::unique_ptr<orbbec::ObResourceConfig> Orbbec::configure(vsdk::Dependencies dependencies, vsdk::ResourceConfig configuration) {
     auto attrs = configuration.attributes();
-
     std::string serial_number_from_config;
-    if (!attrs.count("serial_number")) {
-        throw std::invalid_argument("serial_number is a required argument");
-    }
-
-    const std::string* serial_val = attrs["serial_number"].get<std::string>();
-    if (serial_val == nullptr) {
-        throw std::invalid_argument("serial_number must be a string");
-    }
-
+    const std::string* serial_val = attrs[kAttrSerialNumber].get<std::string>();
     serial_number_from_config = *serial_val;
 
-    auto native_config = std::make_unique<orbbec::ObResourceConfig>(serial_number_from_config, configuration.name());
+    std::optional<DeviceResolution> dev_res = std::nullopt;
+    std::optional<DeviceFormat> dev_fmt = std::nullopt;
+    if (attrs.count(kAttrSensors)) {
+        VIAM_SDK_LOG(info) << "[configure] sensors specified in config";
+        auto sensors = attrs[kAttrSensors].get<viam::sdk::ProtoStruct>();
 
+        auto const color_height = sensors->at(kColorSourceName).get<viam::sdk::ProtoStruct>()->at(kAttrHeight).get_unchecked<double>();
+        auto const color_width = sensors->at(kColorSourceName).get<viam::sdk::ProtoStruct>()->at(kAttrWidth).get_unchecked<double>();
+        auto const color_res = Resolution{static_cast<uint32_t>(color_width), static_cast<uint32_t>(color_height)};
+        auto const color_format = sensors->at(kColorSourceName).get<viam::sdk::ProtoStruct>()->at(kAttrFormat).get_unchecked<std::string>();
+
+        auto const depth_height = sensors->at(kDepthSourceName).get<viam::sdk::ProtoStruct>()->at(kAttrHeight).get_unchecked<double>();
+        auto const depth_width = sensors->at(kDepthSourceName).get<viam::sdk::ProtoStruct>()->at(kAttrWidth).get_unchecked<double>();
+        auto const depth_res = Resolution{static_cast<uint32_t>(depth_width), static_cast<uint32_t>(depth_height)};
+        auto const depth_format = sensors->at(kDepthSourceName).get<viam::sdk::ProtoStruct>()->at(kAttrFormat).get_unchecked<std::string>();
+
+        dev_res = DeviceResolution{color_res, depth_res};
+        dev_fmt = DeviceFormat{color_format, depth_format};
+    } else {
+        VIAM_SDK_LOG(info) << "[configure] no sensors specified in config, using defaults";
+    }
+    auto native_config = std::make_unique<orbbec::ObResourceConfig>(serial_number_from_config, configuration.name(), dev_res, dev_fmt);
+    VIAM_SDK_LOG(info) << "[configure] configured: " << native_config->to_string();
     return native_config;
 }
 // RESOURCE END
 
 // ORBBEC SDK DEVICE REGISTRY START
 void registerDevice(std::string serialNumber, std::shared_ptr<ob::Device> dev) {
-    VIAM_SDK_LOG(info) << "starting " << serialNumber;
-    std::shared_ptr<ob::Pipeline> pipe = std::make_shared<ob::Pipeline>(dev);
-    pipe->enableFrameSync();
-    std::shared_ptr<ob::Config> config = createHwD2CAlignConfig(pipe);
-    if (config == nullptr) {
-        VIAM_SDK_LOG(error) << "Current device does not support hardware depth-to-color "
-                               "alignment.";
-        return;
+    VIAM_SDK_LOG(info) << "[registerDevice] Registering device " << serialNumber;
+
+#ifdef _WIN32
+    // Setup Windows device registry for Orbbec cameras
+    try {
+        windows_registry::setupWindowsDeviceRegistry(dev);
+    } catch (const std::exception& e) {
+        throw std::runtime_error("failed to setup windows device registry: " + std::string(e.what()));
     }
-
-    std::shared_ptr<ob::PointCloudFilter> pointCloudFilter = std::make_shared<ob::PointCloudFilter>();
-    // NOTE: Swap this to depth if you want to align to depth
-    std::shared_ptr<ob::Align> align = std::make_shared<ob::Align>(OB_STREAM_COLOR);
-
-    pointCloudFilter->setCreatePointFormat(OB_FORMAT_RGB_POINT);
+#endif
 
     {
         std::lock_guard<std::mutex> lock(devices_by_serial_mu());
         std::unique_ptr<ViamOBDevice> my_dev = std::make_unique<ViamOBDevice>();
-
-        my_dev->pipe = pipe;
         my_dev->device = dev;
-        my_dev->serial_number = serialNumber;
-        my_dev->pointCloudFilter = pointCloudFilter;
-        my_dev->align = align;
-        my_dev->config = config;
-
+        my_dev->serialNumber = serialNumber;
         devices_by_serial()[serialNumber] = std::move(my_dev);
+        VIAM_SDK_LOG(info) << "[registerDevice] Successfully registered device " << serialNumber;
     }
 }
 
@@ -877,32 +1808,97 @@ void deviceChangedCallback(const std::shared_ptr<ob::DeviceList> removedList, co
                 std::lock_guard<std::mutex> lock(serial_by_resource_mu());
                 for (auto& [resource_name, serial_number] : serial_by_resource()) {
                     if (serial_number == info->getSerialNumber()) {
-                        startDevice(serial_number, resource_name);
+                        // Determine model configuration
+                        std::optional<OrbbecModelConfig> modelConfig = OrbbecModelConfig::forDevice(info->name());
+                        if (!modelConfig.has_value()) {
+                            VIAM_SDK_LOG(error) << "Failed to determine model configuration for device " << serial_number;
+                            continue;
+                        }
+                        configureDevice(serial_number, modelConfig.value());
+                        startDevice(serial_number, modelConfig.value());
                         serial_by_resource()[resource_name] = serial_number;
                     }
                 }
             }
         }
     } catch (ob::Error& e) {
-        std::cerr << "setDeviceChangedCallback\n"
-                  << "function:" << e.getFunction() << "\nargs:" << e.getArgs() << "\nname:" << e.getName() << "\nmessage:" << e.what()
-                  << "\ntype:" << e.getExceptionType() << std::endl;
+        VIAM_SDK_LOG(error) << "setDeviceChangedCallback\n"
+                            << "function:" << e.getFunction() << "\nargs:" << e.getArgs() << "\nname:" << e.getName()
+                            << "\nmessage:" << e.what() << "\ntype:" << e.getExceptionType() << std::endl;
     }
 }
 
 void startOrbbecSDK(ob::Context& ctx) {
     ctx.setDeviceChangedCallback(deviceChangedCallback);
 
-    std::shared_ptr<ob::DeviceList> devList = ctx.queryDeviceList();
-    int devCount = devList->getCount();
-    for (size_t i = 0; i < devCount; i++) {
-        if (i == 0) {
-            VIAM_SDK_LOG(info) << "devCount: " << devCount << "\n";
+    // Enable network device enumeration for Ethernet cameras (like Gemini 335Le)
+    try {
+        ctx.enableNetDeviceEnumeration(true);
+        VIAM_SDK_LOG(info) << "Enabled network device enumeration for Ethernet cameras";
+    } catch (ob::Error& e) {
+        VIAM_SDK_LOG(warn) << "Failed to enable network device enumeration: " << e.what();
+    } catch (const std::exception& e) {
+        VIAM_SDK_LOG(warn) << "Failed to enable network device enumeration: " << e.what();
+    }
+
+    try {
+        // Use SDK's native device discovery (works for both USB and network devices)
+        std::shared_ptr<ob::DeviceList> devList = ctx.queryDeviceList();
+        int devCount = devList->getCount();
+
+        if (devCount == 0) {
+            VIAM_SDK_LOG(warn) << "No Orbbec devices found";
+            return;
         }
-        std::shared_ptr<ob::Device> dev = devList->getDevice(i);
-        std::shared_ptr<ob::DeviceInfo> info = dev->getDeviceInfo();
-        printDeviceInfo(info);
-        registerDevice(info->getSerialNumber(), dev);
+
+        VIAM_SDK_LOG(info) << "Found " << devCount << " Orbbec devices";
+
+        for (size_t i = 0; i < devCount; i++) {
+            try {
+                // Get device information from DeviceList without triggering USB control transfers
+                std::string deviceName = devList->name(i);
+                std::string serialNumber = devList->serialNumber(i);
+                std::string connectionType = devList->connectionType(i);
+                std::string ipAddress = devList->ipAddress(i);
+
+                std::stringstream deviceInfoString;
+                deviceInfoString << "Device " << (i + 1) << " - Name: " << deviceName << ", Serial: " << serialNumber
+                                 << ", Connection: " << connectionType;
+                if (!ipAddress.empty()) {
+                    deviceInfoString << ", IP: " << ipAddress;
+                }
+                VIAM_SDK_LOG(info) << deviceInfoString.str();
+
+                // Only create device if we can get the serial number
+                if (!serialNumber.empty()) {
+                    try {
+                        std::shared_ptr<ob::Device> dev = devList->getDevice(i);
+                        registerDevice(serialNumber, dev);
+                        VIAM_SDK_LOG(info) << "Successfully registered device " << serialNumber;
+                    } catch (ob::Error& devError) {
+                        VIAM_SDK_LOG(warn) << "Failed to create device for " << serialNumber << ": " << devError.what();
+                    }
+                } else {
+                    VIAM_SDK_LOG(warn) << "Skipping device " << (i + 1) << " - no serial number available";
+                }
+            } catch (ob::Error& deviceError) {
+                VIAM_SDK_LOG(warn) << "Failed to process device " << (i + 1) << ": " << deviceError.what();
+                // Continue with other devices even if one fails
+            }
+        }
+    } catch (ob::Error& e) {
+        VIAM_SDK_LOG(error) << "Failed to query Orbbec devices: " << e.what() << " (function: " << e.getFunction()
+                            << ", args: " << e.getArgs() << ", name: " << e.getName() << ", type: " << e.getExceptionType() << ")";
+        VIAM_SDK_LOG(warn) << "Continuing without Orbbec devices - check network connectivity for Ethernet cameras or USB "
+                              "connection for USB cameras";
+    } catch (const std::exception& e) {
+        VIAM_SDK_LOG(error) << "Failed to query Orbbec devices: " << e.what();
+        VIAM_SDK_LOG(warn) << "Continuing without Orbbec devices - check network connectivity for Ethernet cameras or USB "
+                              "connection for USB cameras";
+    } catch (...) {
+        VIAM_SDK_LOG(error) << "Failed to query Orbbec devices: unknown error";
+        VIAM_SDK_LOG(warn) << "Continuing without Orbbec devices - check network connectivity for Ethernet cameras or USB "
+                              "connection for USB cameras";
     }
 }
 // ORBBEC SDK DEVICE REGISTRY END

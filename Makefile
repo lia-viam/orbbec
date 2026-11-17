@@ -1,96 +1,101 @@
+# Detect OS
 OS ?= $(shell uname -s | tr '[:upper:]' '[:lower:]')
-ARCH ?= $(shell uname -m)
-OUTPUT_NAME = orbbec-module
+
+ifeq ($(OS),Windows_NT)
+    BIN_SUFFIX := .exe
+  # Scripts for windows are written in powershell and
+  #	we invoke a wrapper batch script with cmd
+  # syntax, which calls powershell for us and explicitly sets the
+  # exit status so we terminate make on error.
+	SCRIPT_EXT := .bat
+	SHELL := cmd
+	SUBSHELL := cmd /C
+	PATHSEP := \\
+else
+	SCRIPT_EXT = .sh
+	BIN_SUFFIX :=
+	SUBSHELL :=
+	PATHSEP := /
+endif
+
+OUTPUT_NAME = orbbec-module$(BIN_SUFFIX)
 BIN := build-conan/build/RelWithDebInfo/orbbec-module
 TAG_VERSION?=latest
-APPIMAGE := packaging/appimages/deploy/$(OUTPUT_NAME)-$(TAG_VERSION)-$(ARCH).AppImage
 
+# macOS pins the toolchain viamconan's darwin binaries are built with, so its prebuilt packages
+# match. Elsewhere the environment's default profile is used (the build images ship one).
 ifeq ($(OS),darwin)
-  ORBBEC_SDK_VERSION=v2.4.3
-  ORBBEC_SDK_COMMIT=045a0e76
-  ORBBEC_SDK_TIMESTAMP=202505192200
-  ORBBEC_SDK_DIR = OrbbecSDK_$(ORBBEC_SDK_VERSION)_$(ORBBEC_SDK_TIMESTAMP)_$(ORBBEC_SDK_COMMIT)_macOS_beta
-else ifeq ($(OS),linux)
-   ORBBEC_SDK_VERSION=v2.4.8
-   ORBBEC_SDK_COMMIT=ec8e3469
-   ORBBEC_SDK_DIR = OrbbecSDK_$(ORBBEC_SDK_VERSION)_$(ORBBEC_SDK_TIMESTAMP)_$(ORBBEC_SDK_COMMIT)_linux_$(ARCH)
-  ifeq ($(ARCH),x86_64)
-    ORBBEC_SDK_TIMESTAMP = 202507031325
-   else ifeq ($(ARCH), aarch64)
-	ORBBEC_SDK_TIMESTAMP = 202507031330
-  else
-    $(error Unsupported architecture: $(ARCH))
-  endif
+	CONAN_PROFILE ?= ./etc/conan/macos.profile
 else
-  $(error Unsupported OS: $(OS))
+	CONAN_PROFILE ?= default
 endif
 
-
-.PHONY: build lint setup appimage
-
-ifeq ($(OS),linux)
-module.tar.gz: $(APPIMAGE) meta.json
-else
-module.tar.gz: $(BIN) meta.json
-endif
-ifeq ($(OS),linux)
-	mv $(APPIMAGE) $(OUTPUT_NAME)
-	tar -czvf module.tar.gz \
-		$(OUTPUT_NAME) \
-		meta.json \
-		./first_run.sh \
-		./install_udev_rules.sh \
-		./99-obsensor-libusb.rules
-else ifeq ($(OS),darwin)
- # update the rpath https://en.wikipedia.org/wiki/Rpath to look for the orbbec dynamic library
- # in the ./lib folder in the folder produced by the module.tar.gz on the computer that runs the module
- # rather than the build directory of the build machine
-	if otool -l $(BIN) | grep -A2 LC_RPATH | grep -q "path @executable_path/lib"; then \
-		install_name_tool -delete_rpath $(ORBBEC_SDK_DIR)/lib $(BIN); \
-	fi
-	install_name_tool -add_rpath @executable_path/lib $(BIN);
-	tar -czvf module.tar.gz \
-	meta.json \
-    first_run.sh \
-	-C $(ORBBEC_SDK_DIR) lib/ \
-    -C ../$(dir $(BIN)) $(OUTPUT_NAME)
-endif
+.PHONY: build lint setup conan-pkg
 
 build: $(BIN)
 
-$(BIN): lint conanfile.py src/* bin/*
-	export ORBBEC_SDK_DIR=$(ORBBEC_SDK_DIR); \
-	bin/build.sh
+$(BIN): conanfile.py src/* bin/*
+	$(SUBSHELL) bin$(PATHSEP)build$(SCRIPT_EXT)
+
 
 clean:
 	rm -rf packaging/appimages/deploy module.tar.gz
 
 clean-all: clean
 	rm -rf build-conan
-	rm -rf tmp_cpp_sdk  
 	rm -rf venv
 	rm -f orbbec-test-bin
 	rm -f $(OUTPUT_NAME)
 
 setup:
-	export ORBBEC_SDK_VERSION=$(ORBBEC_SDK_VERSION); \
-	export ORBBEC_SDK_DIR=$(ORBBEC_SDK_DIR); \
-	export OS=$(OS); \
-	export ARCH=${ARCH}; \
-	bin/setup.sh
+	$(SUBSHELL) bin$(PATHSEP)setup$(SCRIPT_EXT)
 
 lint:
+ifeq ($(OS),Windows_NT)
+	@echo lint unsupported on windows
+else
 	./bin/run-clang-format.sh
+endif
 
 orbbec-test-bin:
 	cd tests && \
 	go test -c -o orbbec-test-bin ./ && \
 	mv orbbec-test-bin ../
 
-$(APPIMAGE): $(BIN)
-	export TAG_NAME=$(TAG_VERSION); \
-	cd packaging/appimages && \
-	mkdir -p deploy && \
-	rm -f deploy/$(OUTPUT_NAME)* && \
-	appimage-builder --recipe $(OUTPUT_NAME)-$(ARCH).yml
-	cp ./packaging/appimages/$(OUTPUT_NAME)-$(TAG_VERSION)-$(ARCH).AppImage ./packaging/appimages/deploy/
+# Both the commands below need to source/activate the venv in the same line as the
+# conan call because every line of a Makefile runs in a subshell
+#
+# m4 and pkgconf build from source because conancenter's binaries need a newer glibc than the
+# 2.31 cloud build images, where libcurl compiles from source. b2 comes from viamconan, which
+# carries one built for glibc 2.31.
+conan-pkg:
+ifeq ($(OS),Windows_NT)
+# no first run on windows, remove it from meta.json
+	cmd /C powershell -Command "$$json = Get-Content 'meta.json' -Raw | ConvertFrom-Json; $$json.PSObject.Properties.Remove('first_run') | Out-Null; $$json | ConvertTo-Json -Depth 2 | Set-Content 'meta.json'"
+	cmd /C "refreshenv && IF EXIST .\venv\Scripts\activate.bat call .\venv\Scripts\activate.bat && conan create . -o:a "viam-cpp-sdk/*:shared=False" -s:a build_type=Release -s:a compiler.cppstd=17 --build=missing"
+else
+	test -f ./venv/bin/activate && . ./venv/bin/activate; \
+	conan create . \
+	-pr:a $(CONAN_PROFILE) \
+	-o:a "viam-cpp-sdk/*:shared=False" \
+	-s:a build_type=Release \
+	-s:a compiler.cppstd=17 \
+	--build=missing \
+	--build="m4/*" \
+	--build="pkgconf/*"
+endif
+
+module.tar.gz: conan-pkg meta.json
+ifeq ($(OS),Windows_NT)
+	cmd /C "refreshenv && IF EXIST .\venv\Scripts\activate.bat call .\venv\Scripts\activate.bat && conan install --requires=viam-orbbec/0.0.1 -o:a "viam-cpp-sdk/*:shared=False" -s:a build_type=Release -s:a compiler.cppstd=17 --lockfile-partial --deployer-package "^&" --envs-generation false"
+else
+	test -f ./venv/bin/activate && . ./venv/bin/activate; \
+	conan install --requires=viam-orbbec/0.0.1 \
+	-pr:a $(CONAN_PROFILE) \
+	-o:a "viam-cpp-sdk/*:shared=False" \
+	-s:a build_type=Release \
+	-s:a compiler.cppstd=17 \
+	--lockfile-partial \
+	--deployer-package "&" \
+	--envs-generation false
+endif
