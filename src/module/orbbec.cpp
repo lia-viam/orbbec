@@ -30,12 +30,11 @@
 #include <memory>
 #include <mutex>
 #include <ostream>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
-
-#include <boost/core/span.hpp>
 
 #include <viam/sdk/common/proto_value.hpp>
 #include <viam/sdk/components/camera.hpp>
@@ -340,15 +339,14 @@ vsdk::Camera::raw_image encodeColorFrame(std::shared_ptr<ob::Frame> color) {
     vsdk::Camera::raw_image image;
     image.source_name = kColorSourceName;
 
-    std::uint8_t* colorData = (std::uint8_t*)color->getData();
-    if (colorData == nullptr) {
+    if (color->getData() == nullptr) {
         throw std::runtime_error("color data is null");
     }
-    uint32_t colorDataSize = color->dataSize();
+    auto colorData = std::span{static_cast<std::uint8_t const*>(color->getData()), color->dataSize()};
 
     if (color->getFormat() == OB_FORMAT_MJPG) {
         image.mime_type = kColorMimeTypeJPEG;
-        image.bytes.assign(colorData, colorData + colorDataSize);
+        image.bytes.assign(colorData.begin(), colorData.end());
     } else if (color->getFormat() == OB_FORMAT_RGB) {
         image.mime_type = kColorMimeTypePNG;
         auto width = color->getStreamProfile()->as<ob::VideoStreamProfile>()->getWidth();
@@ -371,7 +369,7 @@ std::vector<std::uint8_t> RGBPointsToPCD(std::shared_ptr<ob::Frame> frame, float
         throw std::invalid_argument("RGBPointsToPCD: frame format is not OB_FORMAT_RGB_POINT");
     }
 
-    auto pointSpan = boost::span{reinterpret_cast<OBColorPoint const*>(frame->data()), frame->dataSize() / sizeof(OBColorPoint)};
+    auto pointSpan = std::span{reinterpret_cast<OBColorPoint const*>(frame->data()), frame->dataSize() / sizeof(OBColorPoint)};
 
     std::vector<PointXYZRGB> pcdPoints;
 
@@ -402,13 +400,13 @@ std::vector<std::uint8_t> RGBPointsToPCD(std::shared_ptr<ob::Frame> frame, float
     std::vector<std::uint8_t> pcdBytes;
     pcdBytes.insert(pcdBytes.end(), headerStr.begin(), headerStr.end());
 
-    // PointXYZRGB is POD with no padding, and vector is contiguous, so the points can be copied as bytes.
-    static_assert(std::is_pod_v<PointXYZRGB>);
+    // PointXYZRGB is trivially copyable with no padding, and vector is contiguous, so the points can be copied as bytes.
+    static_assert(std::is_trivially_copyable_v<PointXYZRGB>);
     static_assert(sizeof(PointXYZRGB) == (3 * sizeof(float)) + sizeof(std::uint32_t), "PointXYZRGB has unexpected padding");
 
-    auto byteSpan = boost::as_bytes(boost::span{pcdPoints});
-    pcdBytes.insert(
-        pcdBytes.end(), reinterpret_cast<std::uint8_t const*>(byteSpan.begin()), reinterpret_cast<std::uint8_t const*>(byteSpan.end()));
+    auto pointBytes = std::as_bytes(std::span{pcdPoints});
+    auto byteSpan = std::span{reinterpret_cast<std::uint8_t const*>(pointBytes.data()), pointBytes.size()};
+    pcdBytes.insert(pcdBytes.end(), byteSpan.begin(), byteSpan.end());
 
     return pcdBytes;
 }
@@ -1398,10 +1396,10 @@ vsdk::Camera::image_collection Orbbec::get_images(std::vector<std::string> filte
             depth = fs->getFrame(OB_FRAME_DEPTH);
             validateDepthFrame(depth, device_format_opt, *model_config_);
 
-            unsigned char* depthData = (unsigned char*)depth->getData();
-            if (depthData == nullptr) {
+            if (depth->getData() == nullptr) {
                 throw std::runtime_error("[get_images] depth data is null");
             }
+            auto depthData = std::span{static_cast<std::uint8_t const*>(depth->getData()), depth->dataSize()};
             auto depthVid = depth->as<ob::VideoFrame>();
             float valueScale = depth->as<ob::DepthFrame>()->getValueScale();
 
@@ -1639,17 +1637,14 @@ vsdk::Camera::point_cloud Orbbec::get_point_cloud(std::string mime_type, const v
         validateColorFrame(color, std::nullopt, *model_config_);
         validateDepthFrame(depth, std::nullopt, *model_config_);
 
-        std::uint8_t* colorData = (std::uint8_t*)color->getData();
-        if (colorData == nullptr) {
+        if (color->getData() == nullptr) {
             throw std::runtime_error("[get_point_cloud] color data is null");
         }
-        std::uint32_t colorDataSize = color->dataSize();
 
         std::shared_ptr<ob::DepthFrame> depthFrame = depth->as<ob::DepthFrame>();
         float scale = depthFrame->getValueScale();
 
-        std::uint8_t* depthData = (std::uint8_t*)depth->getData();
-        if (depthData == nullptr) {
+        if (depth->getData() == nullptr) {
             throw std::runtime_error("[get_point_cloud] depth data is null");
         }
 
@@ -1698,7 +1693,7 @@ vsdk::Camera::point_cloud Orbbec::get_point_cloud(std::string mime_type, const v
                 outfile_name << "pointcloud_" << timestamp << ".pcd";
             }
             std::ofstream outfile(outfile_name.str(), std::ios::out | std::ios::binary);
-            outfile.write((const char*)&data[0], data.size());
+            outfile.write(reinterpret_cast<const char*>(data.data()), data.size());
 
             std::filesystem::path file_path(outfile_name.str());
             std::filesystem::path absolute_path = std::filesystem::absolute(file_path);
